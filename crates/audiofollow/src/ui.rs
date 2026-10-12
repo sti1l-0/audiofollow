@@ -438,22 +438,43 @@ impl AppState {
             return "音频接口不可用，无法还原".into();
         };
         let roles = self.config.roles.clone();
-        let changes = self.reconciler.restore_all(env, &roles);
+        // 第二阶段（遗留清扫）的目标设备集合 = 所有绑定里配置过的端点。
+        let rule_endpoints: Vec<String> = self
+            .config
+            .rules
+            .iter()
+            .map(|r| r.endpoint_id.clone())
+            .collect();
+        let changes = self.reconciler.restore_all(env, &roles, &rule_endpoints);
         let done = changes.len();
         for c in &changes {
-            println!("[还原] {}", c.line());
+            self.log(c.line());
         }
         self.last_action.clear();
+        let swept = self.reconciler.last_swept();
         let leftovers = self.reconciler.leftovers().to_vec();
-        if leftovers.is_empty() {
-            format!("已还原 {done} 个进程的音频路由")
-        } else {
-            format!(
-                "已还原 {done} 个进程；另有 {} 个进程原是「跟随系统默认」，接口无法写回空值，\
+        if done == 0 && swept == 0 {
+            let has_rules = !rule_endpoints.is_empty();
+            return if has_rules {
+                "没有需要还原的改动：本会话没有改道任何进程，\
+                 也没有发现指向绑定设备的遗留记录"
+                    .into()
+            } else {
+                "没有需要还原的改动：本会话没有改道任何进程（也还没有绑定）".into()
+            };
+        }
+        let mut msg = format!("已还原 {done} 个进程的音频路由");
+        if swept > 0 {
+            msg.push_str(&format!("，另清除 {swept} 条历史遗留记录"));
+        }
+        if !leftovers.is_empty() {
+            msg.push_str(&format!(
+                "；另有 {} 个进程原是「跟随系统默认」，接口无法写回空值，\
                  其固定记录会留在系统里（可在系统音量合成器里手动改回）",
                 leftovers.len()
-            )
+            ));
         }
+        msg
     }
 
     fn shutdown(&mut self) {

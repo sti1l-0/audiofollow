@@ -83,6 +83,8 @@ pub struct Reconciler {
     backups: HashMap<u32, Option<String>>,
     /// 因为原值是"跟随系统默认"而无法还原的进程。
     leftovers: Vec<u32>,
+    /// 上次 restore_all 第二阶段清扫掉的遗留记录数。
+    last_swept: usize,
 }
 
 impl Reconciler {
@@ -113,6 +115,11 @@ impl Reconciler {
     /// 因为接口限制而无法还原的进程。
     pub fn leftovers(&self) -> &[u32] {
         &self.leftovers
+    }
+
+    /// 上次 restore_all 第二阶段清扫掉的遗留记录数。
+    pub fn last_swept(&self) -> usize {
+        self.last_swept
     }
 
     /// 按计划执行一次差量同步。
@@ -343,11 +350,28 @@ impl Reconciler {
     }
 
     /// 退出前把所有改动还原。
-    pub fn restore_all(&mut self, env: &AudioEnv, roles: &[Role]) -> Vec<Change> {
+    ///
+    /// 两阶段：
+    /// 1. 精确还原 —— 遍历本会话记录在 `applied` 里的进程，按备份还原。
+    /// 2. 遗留清扫 —— 遍历当前所有有音频会话的进程，凡持久化记录指向
+    ///    `rule_endpoints`（本工具各绑定配置的目标设备）的，一律写空清除。
+    ///
+    /// 为什么要第二阶段：`SetPersistedDefaultAudioEndpoint` 的记录是**持久化**
+    /// 的，进程退出后仍留在系统里，pid 甚至会被新进程继承。程序重启后
+    /// `applied` 是空的，单靠第一阶段永远清不掉历史会话留下的记录。
+    /// 只清"指向绑定目标设备"的记录是安全的：那些设备正是本工具会写入的
+    /// 目标；用户手动固定到其他设备的记录不受影响。
+    pub fn restore_all(
+        &mut self,
+        env: &AudioEnv,
+        roles: &[Role],
+        rule_endpoints: &[String],
+    ) -> Vec<Change> {
         let mut changes = Vec::new();
         let mut pids: Vec<u32> = self.applied.keys().copied().collect();
         pids.sort_unstable();
 
+        let mut restored: Vec<u32> = Vec::new();
         for pid in pids {
             let who = self.who(pid);
             let original = self.backups.get(&pid).cloned().flatten();
@@ -356,6 +380,7 @@ impl Reconciler {
                     let outcome = env.route_to_id(pid, &id, roles);
                     if outcome.applied() {
                         self.applied.remove(&pid);
+                        restored.push(pid);
                         changes.push(Change {
                             pid,
                             who,
@@ -378,6 +403,7 @@ impl Reconciler {
                     let outcome = env.clear_route(pid, roles);
                     if outcome.applied() {
                         self.applied.remove(&pid);
+                        restored.push(pid);
                         changes.push(Change {
                             pid,
                             who,
@@ -398,6 +424,38 @@ impl Reconciler {
                 }
             }
         }
+
+        // ---- 第二阶段：遗留清扫 ----
+        let mut swept = 0usize;
+        if !rule_endpoints.is_empty() {
+            for pid in env.session_pids() {
+                if restored.contains(&pid) || self.applied.contains_key(&pid) {
+                    continue; // 第一阶段刚处理过，或还在记账里（还原失败的）
+                }
+                // 任一角色上的固定记录命中绑定目标设备 → 清掉
+                let hit = roles.iter().any(|role| {
+                    env.get_route(pid, *role)
+                        .ok()
+                        .and_then(|r| r.device_id().map(String::from))
+                        .is_some_and(|id| rule_endpoints.iter().any(|e| *e == id))
+                });
+                if !hit {
+                    continue;
+                }
+                let outcome = env.clear_route(pid, roles);
+                if outcome.applied() {
+                    swept += 1;
+                    changes.push(Change {
+                        pid,
+                        who: self.who(pid),
+                        action: Action::Unrouted,
+                        detail: "已清除遗留记录（历史会话写入，恢复跟随系统默认）".into(),
+                    });
+                }
+            }
+        }
+        self.last_swept = swept;
+
         changes
     }
 

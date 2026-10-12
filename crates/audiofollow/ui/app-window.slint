@@ -435,7 +435,10 @@ export component AppWindow inherits Window {
                                 // "✕" 字符缺字形(渲染成豆腐块),用 Path 画两条线。
                                 Rectangle {
                                     width: 28px;
-                                    del-ta := TouchArea { mouse-cursor: pointer; }
+                                    del-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.remove-rule(index); }
+                                    }
                                     Rectangle {
                                         width: 22px;
                                         height: 22px;
@@ -498,9 +501,13 @@ export component AppWindow inherits Window {
                 }
 
                 ListView {
-                    // 始终钉在底部:日志要的是"看到最新的"。
-                    // content-height ≥ height 时取 0,否则取 -(溢出量)。
-                    content-y: min(0, self.height - self.content-height);
+                    // 钉底用 changed 回调而不是声明式绑定：用户滚轮一滚，
+                    // slint 会写入 content-y 并**断开**声明式绑定（in-out 属性
+                    // 被外部赋值后绑定失效），之后新日志看起来就"不刷新"了。
+                    // changed 回调在每次 content-height 变化时强制拉回底部。
+                    changed content-height => {
+                        self.content-y = min(0, self.height - self.content-height);
+                    }
                     for e in root.log-entries : HorizontalLayout {
                         height: 19px;
                         spacing: 8px;
