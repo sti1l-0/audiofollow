@@ -151,58 +151,8 @@ fn run_loop(
     });
 }
 
-/// 画一个 32×32 的托盘图标：蓝色圆角底 + 白色扬声器 + 两道声波。
+/// 托盘图标来自 `icon.rs` 的统一源图（与窗口/任务栏同一份几何）。
 fn tray_icon() -> Result<Icon, String> {
-    const SIZE: usize = 32;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-
-    let bg = [0x2F, 0x6F, 0xED, 0xFF];
-    let fg = [0xFF, 0xFF, 0xFF, 0xFF];
-
-    // 圆角矩形底
-    let r = 7i32;
-    for y in 0..SIZE as i32 {
-        for x in 0..SIZE as i32 {
-            let cx = x.clamp(r, SIZE as i32 - 1 - r);
-            let cy = y.clamp(r, SIZE as i32 - 1 - r);
-            let (dx, dy) = (x - cx, y - cy);
-            if dx * dx + dy * dy <= r * r {
-                put(&mut rgba, SIZE, x, y, bg);
-            }
-        }
-    }
-
-    // 扬声器：左侧箱体
-    for y in 12..20 {
-        for x in 7..10 {
-            put(&mut rgba, SIZE, x, y, fg);
-        }
-    }
-    // 喇叭口（向右张开的三角形）
-    for x in 10..17 {
-        let half = (x - 10) as i32 + 2;
-        for y in (16 - half)..(16 + half) {
-            put(&mut rgba, SIZE, x, y, fg);
-        }
-    }
-
-    // 声波弧
-    for radius in [6.0f64, 9.0f64] {
-        for deg in -50..=50 {
-            let a = (deg as f64).to_radians();
-            let x = 16.0 + radius * a.cos();
-            let y = 16.0 + radius * a.sin();
-            put(&mut rgba, SIZE, x.round() as i32, y.round() as i32, fg);
-        }
-    }
-
-    Icon::from_rgba(rgba, SIZE as u32, SIZE as u32).map_err(|e| e.to_string())
-}
-
-fn put(rgba: &mut [u8], size: usize, x: i32, y: i32, color: [u8; 4]) {
-    if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
-        return;
-    }
-    let i = (y as usize * size + x as usize) * 4;
-    rgba[i..i + 4].copy_from_slice(&color);
+    let rgba = crate::icon::tray_rgba()?;
+    Icon::from_rgba(rgba, crate::icon::TRAY_PX, crate::icon::TRAY_PX).map_err(|e| e.to_string())
 }

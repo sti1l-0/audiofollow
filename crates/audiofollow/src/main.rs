@@ -6,6 +6,7 @@
 //! - `--hook-test`：单独验证窗口事件钩子通不通（必要时会挪动一个窗口 2px 再复原）
 //! - `--write-test [pid]`：在单个进程上做可回滚的写入往返验证
 
+mod icon;
 mod selftest;
 mod tray;
 mod ui;
