@@ -19,6 +19,9 @@ pub type LONG = i32;
 pub type HRESULT = i32;
 pub type WPARAM = usize;
 pub type HWINEVENTHOOK = isize;
+/// 注册表键句柄。64 位下是 `HANDLE` 大小；预定义根键用**符号扩展**的 32 位值
+/// （winreg.h 里写的是 `(HKEY)(ULONG_PTR)((LONG)0x80000002)`）。
+pub type HKEY = isize;
 
 // ------------------------------------------------------------------ 基础结构 --
 
@@ -103,6 +106,11 @@ pub struct MONITORINFOEXW {
 
 /// 与 Win32 `DISPLAY_DEVICEW` 二进制兼容。用来取显示器的**用户可辨认名称**
 /// （`MONITORINFOEXW` 只给 `\\.\DISPLAY1` 这种设备名）。
+///
+/// 字段顺序必须严格照抄 winuser.h：`DeviceString` 与 `DeviceID` 之间夹着一个
+/// `StateFlags`。漏掉它会整体错位 4 字节，`DeviceID` 读出来以 `StateFlags` 的高
+/// 16 位（= 0）开头，于是被当成空串——**不报错、不崩溃，只是永远取不到名字**。
+/// 下面有 `const` 断言钉住总长度。
 pub const CCHDEVICENAME_128: usize = 128;
 
 #[repr(C)]
@@ -111,9 +119,13 @@ pub struct DISPLAY_DEVICEW {
     pub cb: u32,
     pub DeviceName: [u16; CCHDEVICENAME],
     pub DeviceString: [u16; CCHDEVICENAME_128],
+    pub StateFlags: u32,
     pub DeviceID: [u16; CCHDEVICENAME_128],
     pub DeviceKey: [u16; CCHDEVICENAME_128],
 }
+
+// 4 + 64 + 256 + 4 + 256 + 256 = 840
+const _: () = assert!(std::mem::size_of::<DISPLAY_DEVICEW>() == 840);
 
 /// 与 Win32 `SYSTEMTIME` 二进制兼容。只为日志打时间戳。
 #[repr(C)]
@@ -241,6 +253,22 @@ pub const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
 pub const DWMWA_CLOAKED: u32 = 14;
 
 pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// [`EnumDisplayDevicesW`] 的 `dwFlags`：返回**设备接口路径**而不是显示名。
+/// 它给的 `DeviceID` 形如 `\\?\DISPLAY#ACM2428#7&1a2b3c4d&0&UID0001#{e6f07b5f-...}`，
+/// 中间两段正好是注册表实例键（见 `monitor::edid_from_interface_path`）。
+pub const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
+
+// ---- 注册表（读显示器 EDID 用） ----
+
+/// `HKEY_LOCAL_MACHINE`。`0x80000002` 按 32 位有符号解释再符号扩展。
+pub const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002u32 as i32 as HKEY;
+/// `KEY_READ` = `STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY`。
+pub const KEY_READ: u32 = 0x0002_0019;
+pub const ERROR_SUCCESS: i32 = 0;
+pub const REG_BINARY: u32 = 3;
+/// EDID 基础块 128 字节，最多 3 个扩展块；给点余量防止被超长值撑爆。
+pub const EDID_MAX_LEN: u32 = 4 * 1024;
 
 // --------------------------------------------------------------- extern 块 --
 
@@ -370,6 +398,30 @@ extern "system" {
 
     pub fn GetCurrentThreadId() -> DWORD;
     pub fn GetLastError() -> DWORD;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    /// 打开注册表子键。只读场景用 `KEY_READ`。
+    pub fn RegOpenKeyExW(
+        hKey: HKEY,
+        lpSubKey: *const u16,
+        ulOptions: DWORD,
+        samDesired: DWORD,
+        phkResult: *mut HKEY,
+    ) -> i32;
+
+    /// 读一个值。`lpData` 传 null、`lpcbData` 传 0 时只回填所需长度。
+    pub fn RegQueryValueExW(
+        hKey: HKEY,
+        lpValueName: *const u16,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+
+    pub fn RegCloseKey(hKey: HKEY) -> i32;
 }
 
 #[link(name = "ole32")]

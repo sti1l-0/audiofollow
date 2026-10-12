@@ -148,47 +148,238 @@ fn is_placeholder(name: &str) -> bool {
         .any(|n| low.contains(n) || s.contains(n))
 }
 
-/// 取显示器型号名。`MONITORINFOEXW::szDevice` 只给 `\\.\DISPLAY1`，
-/// 拿它再问一次 `EnumDisplayDevicesW` 才能得到型号。
+/// 取显示器型号名。
 ///
-/// 很多显示器（尤其是虚拟显示器、没有 EDID 型号段的）报回来的 `DeviceString`
-/// 就是一句 "Generic PnP Monitor"，信息量为零。这时换用
-/// `EDD_GET_DEVICE_INTERFACE_NAME` 再问一次——它给的设备接口路径形如
-/// `\\?\DISPLAY#MON-A#5&1a2b3c4d&0&UID256#{e6f07b5f-...}`，第二段就是型号。
-/// 这个型号通常正好和音频设备名里的型号一致（例如 "MON-A (High Definition Audio)"），
-/// 用户就能一眼把哪块屏对哪个音箱对上号。
+/// 三步走，从最权威到最将就：
 ///
-/// **两条路都拿不到时返回空串**，由调用方退回「显示器 N」。
+/// 1. **EDID 里的 `0xFC` 描述符**。这是显示器**自己报上来的**名字（EDID 是显示器固件里的
+///    一段数据，型号名就在其中），不受驱动影响。本机实测：`MON-A`、`MON-B`。
+///    拿它的路径是设备接口路径 → 注册表实例键 → `Device Parameters\EDID`。
+/// 2. `EnumDisplayDevicesW` 的 `DeviceString`。有些机器的驱动会在这里填真型号，
+///    但更多时候给的是 `Generic PnP Monitor` 这种占位串。
+/// 3. 设备接口路径中间的**硬件型号段**，形如 `ACM2428`（= EDID 厂商码 `ACM` + 产品码 `2428`）。
+///    能区分两块屏，但可读性不如 1。
+///
+/// 三条都拿不到就返回空串，由调用方退回「显示器 N」。
+///
+/// > 为什么不用 `SetupDiGetDeviceRegistryProperty(SPDRP_FRIENDLY_NAME)`：它给的是
+/// > `Generic Monitor (MON-A)`，要从括号里抠出来，且需要多一整套 SetupAPI 声明；
+/// > 而 EDID 那条路只需要注册表四个 API，还能顺带拿到厂商码与物理尺寸。
 fn describe(device: &[u16; ffi::CCHDEVICENAME]) -> String {
-    const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
-
     unsafe {
         let mut dd: ffi::DISPLAY_DEVICEW = std::mem::zeroed();
         dd.cb = std::mem::size_of::<ffi::DISPLAY_DEVICEW>() as u32;
         if ffi::EnumDisplayDevicesW(device.as_ptr(), 0, &mut dd, 0) == 0 {
             return String::new();
         }
-        let from_device_string = ffi::utf16_arr_to_string(&dd.DeviceString);
-        if !is_placeholder(&from_device_string) {
-            return from_device_string;
+        let device_string = ffi::utf16_arr_to_string(&dd.DeviceString);
+
+        // 再问一次要设备接口路径。它带的信息比 DeviceString 有用得多：
+        // 中间两段正好是注册表实例键的位置，顺着就能读到 EDID。
+        let mut di: ffi::DISPLAY_DEVICEW = std::mem::zeroed();
+        di.cb = std::mem::size_of::<ffi::DISPLAY_DEVICEW>() as u32;
+        let iface_path = if ffi::EnumDisplayDevicesW(
+            device.as_ptr(),
+            0,
+            &mut di,
+            ffi::EDD_GET_DEVICE_INTERFACE_NAME,
+        ) != 0
+        {
+            ffi::utf16_arr_to_string(&di.DeviceID)
+        } else {
+            String::new()
+        };
+
+        // ---- 1) EDID 自报的型号名 ----
+        if let Some(edid) = edid_from_interface_path(&iface_path) {
+            if let Some(name) = monitor_name_from_edid(&edid) {
+                return name;
+            }
         }
 
-        // 设备接口路径里的型号段
-        let mut dd2: ffi::DISPLAY_DEVICEW = std::mem::zeroed();
-        dd2.cb = std::mem::size_of::<ffi::DISPLAY_DEVICEW>() as u32;
-        if ffi::EnumDisplayDevicesW(device.as_ptr(), 0, &mut dd2, EDD_GET_DEVICE_INTERFACE_NAME) != 0
-        {
-            let path = ffi::utf16_arr_to_string(&dd2.DeviceID);
-            // \\?\DISPLAY#<型号>#<实例>#{接口 GUID}
-            if let Some(model) = path.split('#').nth(1) {
-                if !is_placeholder(model) {
-                    return model.to_string();
-                }
+        // ---- 2) 驱动填的 DeviceString ----
+        if !is_placeholder(&device_string) {
+            return device_string;
+        }
+
+        // ---- 3) 接口路径里的硬件型号段 ----
+        if let Some(model) = iface_path.split('#').nth(1) {
+            if !is_placeholder(model) {
+                return model.to_string();
             }
         }
 
         // 实在没有型号。留空，让上层显示「显示器 N」。
         String::new()
+    }
+}
+
+// ---------------------------------------------------------------- EDID 读取 --
+
+/// 从设备接口路径解出注册表实例键的三段：(枚举器, 硬件 ID, 实例 ID)。
+///
+/// 输入形如
+/// `\\?\DISPLAY#ACM2428#7&1a2b3c4d&0&UID0001#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}`，
+/// 对应注册表 `HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\ACM2428\7&1a2b3c4d&0&UID0001`。
+///
+/// 传进来的不是接口路径（例如 `EnumDisplayDevicesW` 没带 flag 时给的
+/// `MONITOR\ACM2428\{4d36e96e-...}\0004`）时返回 `None`——那条路径不是实例键，
+/// 顺着它读不到 EDID。
+fn registry_key_of_interface_path(path: &str) -> Option<(&str, &str, &str)> {
+    // `\\?\DISPLAY#ACM2428#7&1a2b3c4d&0&UID0001#{...}`
+    //   → ["\\?\DISPLAY", "ACM2428", "7&1a2b3c4d&0&UID0001", "{...}"]
+    let parts: Vec<&str> = path.split('#').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    // `\\?\DISPLAY` → "DISPLAY"
+    let enumerator = parts[0].rsplit('\\').next().unwrap_or("");
+    if enumerator.is_empty() {
+        return None;
+    }
+    if parts[1].is_empty() || parts[2].is_empty() {
+        return None;
+    }
+    Some((enumerator, parts[1], parts[2]))
+}
+
+/// 读该显示器在注册表里的 EDID。
+fn edid_from_interface_path(path: &str) -> Option<Vec<u8>> {
+    let (enumerator, hwid, instance) = registry_key_of_interface_path(path)?;
+    let subkey = format!(
+        r"SYSTEM\CurrentControlSet\Enum\{enumerator}\{hwid}\{instance}\Device Parameters"
+    );
+    reg_read_binary(&subkey, "EDID")
+}
+
+/// 读一个 `REG_BINARY` 值。任何一步失败都返回 `None`，绝不 panic。
+fn reg_read_binary(subkey: &str, value: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let sub = ffi::wide(subkey);
+        let mut hkey: ffi::HKEY = 0;
+        if ffi::RegOpenKeyExW(
+            ffi::HKEY_LOCAL_MACHINE,
+            sub.as_ptr(),
+            0,
+            ffi::KEY_READ,
+            &mut hkey,
+        ) != ffi::ERROR_SUCCESS
+        {
+            return None;
+        }
+
+        let name = ffi::wide(value);
+        let mut ty: u32 = 0;
+        let mut len: u32 = 0;
+        // 先问长度（lpData 传 null）
+        let rc = ffi::RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            std::ptr::null_mut(),
+            &mut len,
+        );
+        if rc != ffi::ERROR_SUCCESS || ty != ffi::REG_BINARY || len == 0 || len > ffi::EDID_MAX_LEN
+        {
+            ffi::RegCloseKey(hkey);
+            return None;
+        }
+
+        let mut buf = vec![0u8; len as usize];
+        let rc = ffi::RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            buf.as_mut_ptr(),
+            &mut len,
+        );
+        ffi::RegCloseKey(hkey);
+        if rc != ffi::ERROR_SUCCESS {
+            return None;
+        }
+        buf.truncate((len as usize).min(buf.len()));
+        Some(buf)
+    }
+}
+
+/// EDID 基础块的 4 个 18 字节描述符槽位。
+const EDID_DESCRIPTOR_OFFSETS: [usize; 4] = [0x36, 0x48, 0x5A, 0x6C];
+/// 描述符 tag：显示器名。
+const EDID_TAG_MONITOR_NAME: u8 = 0xFC;
+
+/// 从 EDID 里抠出显示器名。
+///
+/// EDID 基础块 128 字节，第 54 字节起有 4 个 18 字节的"描述符"槽。如果某个槽的头三字节
+/// 是 0、第 4 字节是 tag，它就装的是一条文本：tag `0xFC` 是显示器名（13 字节 ASCII，
+/// 以 `0x0A` 或 `0x00` 收尾）。其余 tag（`0xFF` 序列号、`0xFE` 文本、`0xFB` 色域）
+/// 不是我们要的。
+///
+/// 槽位里也可能是"详细时序数据"而不是文本描述符——判据就是头三字节非零。这时跳过。
+fn monitor_name_from_edid(edid: &[u8]) -> Option<String> {
+    for &off in &EDID_DESCRIPTOR_OFFSETS {
+        if edid.len() < off + 18 {
+            break;
+        }
+        if edid[off] != 0 || edid[off + 1] != 0 || edid[off + 2] != 0 {
+            continue; // 详细时序数据，不是文本描述符
+        }
+        if edid[off + 3] != EDID_TAG_MONITOR_NAME {
+            continue;
+        }
+        // 第 4 字节保留，第 5..18 是 13 字节文本
+        let raw = &edid[off + 5..off + 18];
+        // 只取可打印 ASCII：厂商偶尔会填进非 ASCII 垃圾，直接丢字符比乱码强
+        let s: String = raw
+            .iter()
+            .take_while(|&&b| b != 0x0A && b != 0x00)
+            .filter(|&&b| (0x20..0x7F).contains(&b))
+            .map(|&b| b as char)
+            .collect();
+        let s = s.trim().to_string();
+        if !s.is_empty() && !is_placeholder(&s) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// EDID 第 8-9 字节里的厂商码（3 个字母，各占 5 位、偏移 64）。
+///
+/// 本机的 `ACM`（MON-A）、`ACN`（MON-B）、以及注册表里留着的 `ACO`（Z2719Q）。
+/// 型号名取不到时，用它至少能告诉用户"这是哪家的屏"。
+pub fn edid_manufacturer(edid: &[u8]) -> Option<String> {
+    if edid.len() < 10 {
+        return None;
+    }
+    let v = ((edid[8] as u16) << 8) | edid[9] as u16;
+    let mfg: String = [(v >> 10) & 0x1F, (v >> 5) & 0x1F, v & 0x1F]
+        .iter()
+        .map(|&c| if c == 0 { '?' } else { (c as u8 + 64) as char })
+        .collect();
+    if mfg.contains('?') {
+        return None;
+    }
+    Some(mfg)
+}
+
+/// 读某块显示器当前的 EDID（诊断用，`--selftest` 会打印厂商码）。
+pub fn edid_of(device: &str) -> Option<Vec<u8>> {
+    let dev = ffi::wide(device);
+    unsafe {
+        let mut di: ffi::DISPLAY_DEVICEW = std::mem::zeroed();
+        di.cb = std::mem::size_of::<ffi::DISPLAY_DEVICEW>() as u32;
+        if ffi::EnumDisplayDevicesW(
+            dev.as_ptr(),
+            0,
+            &mut di,
+            ffi::EDD_GET_DEVICE_INTERFACE_NAME,
+        ) == 0
+        {
+            return None;
+        }
+        edid_from_interface_path(&ffi::utf16_arr_to_string(&di.DeviceID))
     }
 }
 
@@ -338,5 +529,110 @@ mod tests {
         a.name = "MON-A".into();
         assert_eq!(a.label(0), "显示器 1 · MON-A · 2560×1440 · 主屏");
         assert_eq!(a.display_name(1), "MON-A");
+    }
+
+    // ------------------------------------------------------------ EDID 读取 ----
+
+    /// 造一个只有型号描述符的 EDID 基础块。
+    fn fake_edid(name: &str) -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        e[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        let off = EDID_DESCRIPTOR_OFFSETS[0];
+        e[off + 3] = EDID_TAG_MONITOR_NAME;
+        let b = name.as_bytes();
+        let n = b.len().min(13);
+        e[off + 5..off + 5 + n].copy_from_slice(&b[..n]);
+        if n < 13 {
+            e[off + 5 + n] = 0x0A;
+        }
+        e
+    }
+
+    #[test]
+    fn interface_path_is_split_into_registry_key() {
+        // 本机 DISPLAY1 的实际值
+        let p = r"\\?\DISPLAY#ACM2428#7&1a2b3c4d&0&UID0001#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(
+            registry_key_of_interface_path(p),
+            Some(("DISPLAY", "ACM2428", "7&1a2b3c4d&0&UID0001"))
+        );
+        // 不带 EDD flag 时 `EnumDisplayDevicesW` 给的是 class key 路径，不是实例键。
+        // 顺着它读 EDID 会读到别的东西（或读不到），必须拒绝。
+        assert!(registry_key_of_interface_path(
+            r"MONITOR\ACM2428\{4d36e96e-e325-11ce-bfc1-08002be10318}\0004"
+        )
+        .is_none());
+        assert!(registry_key_of_interface_path("").is_none());
+        assert!(registry_key_of_interface_path(r"\\?\DISPLAY#ACM2428#").is_none());
+    }
+
+    #[test]
+    fn edid_monitor_name_is_extracted() {
+        assert_eq!(
+            monitor_name_from_edid(&fake_edid("MON-A")).as_deref(),
+            Some("MON-A")
+        );
+        assert_eq!(
+            monitor_name_from_edid(&fake_edid("Z2719Q")).as_deref(),
+            Some("Z2719Q")
+        );
+        // 满 13 字节、没有终止符也要能取全
+        assert_eq!(
+            monitor_name_from_edid(&fake_edid("ABCDEFGHIJKLM")).as_deref(),
+            Some("ABCDEFGHIJKLM")
+        );
+    }
+
+    #[test]
+    fn edid_name_in_any_descriptor_slot() {
+        // 名字落在最后一个槽（0x6C）也要找得到——本机 ACN0039 的 MON-B 就不在第一个槽
+        let mut e = vec![0u8; 128];
+        let off = EDID_DESCRIPTOR_OFFSETS[3];
+        e[off + 3] = EDID_TAG_MONITOR_NAME;
+        e[off + 5..off + 8].copy_from_slice(b"MON-B");
+        e[off + 8] = 0x0A;
+        assert_eq!(monitor_name_from_edid(&e).as_deref(), Some("MON-B"));
+    }
+
+    #[test]
+    fn gibberish_edid_yields_no_name() {
+        // 全零：头三字节为 0 但 tag 是 0，不是 0xFC，不该被当成名字
+        assert_eq!(monitor_name_from_edid(&vec![0u8; 128]), None);
+        // 头三字节非零 = 详细时序数据，跳过
+        let mut e = vec![0u8; 128];
+        for off in EDID_DESCRIPTOR_OFFSETS {
+            e[off] = 0x12;
+        }
+        assert_eq!(monitor_name_from_edid(&e), None);
+        // 太短，读不了
+        assert_eq!(monitor_name_from_edid(&[0u8; 16]), None);
+        // 描述符里只有占位串
+        assert_eq!(monitor_name_from_edid(&fake_edid("Generic PnP")), None);
+        // 非 ASCII 垃圾要滤掉，不能变成乱码
+        let mut e2 = fake_edid("A");
+        let off = EDID_DESCRIPTOR_OFFSETS[0];
+        e2[off + 6] = 0xC4; // 一个非法 UTF-8/ASCII 字节
+        e2[off + 7] = b'B';
+        e2[off + 8] = 0x0A;
+        assert_eq!(monitor_name_from_edid(&e2).as_deref(), Some("AB"));
+    }
+
+    #[test]
+    fn edid_manufacturer_is_decoded() {
+        // "ACM" → S=19, K=11, G=7 → (19<<10)|(11<<5)|7 = 0x4D67
+        let mut e = vec![0u8; 16];
+        e[8] = 0x4D;
+        e[9] = 0x67;
+        assert_eq!(edid_manufacturer(&e).as_deref(), Some("ACM"));
+
+        // "DEL" → D=4, E=5, L=12 → (4<<10)|(5<<5)|12 = 4096+160+12 = 4268 = 0x10AC
+        let mut d = vec![0u8; 16];
+        d[8] = 0x10;
+        d[9] = 0xAC;
+        assert_eq!(edid_manufacturer(&d).as_deref(), Some("DEL"));
+
+        // 全零不是合法厂商码
+        assert_eq!(edid_manufacturer(&vec![0u8; 16]), None);
+        assert_eq!(edid_manufacturer(&[0u8; 4]), None);
     }
 }
