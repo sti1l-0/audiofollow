@@ -1,0 +1,135 @@
+// AudioFollow 设置窗口
+//
+// 这里的界面刻意保持简单：一张「屏幕 → 设备」的绑定列表 + 几个按钮 + 一块日志。
+// 项目本身的 UI 只有这一屏，不需要引入 Web 技术栈。
+
+import { Button, CheckBox, ComboBox, ListView, ScrollView } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "音频跟随 · 设置";
+    width: 820px;
+    height: 600px;
+    background: #f6f7f9;
+
+    // ---- 供 Rust 侧读写的数据 ----
+    in-out property <[string]> monitor-lines: [];
+    in-out property <[string]> endpoint-lines: [];
+    in-out property <[string]> rule-lines: [];
+    in-out property <[string]> log-lines: [];
+    in-out property <int> monitor-index: 0;
+    in-out property <int> endpoint-index: 0;
+    in-out property <int> selected-rule: -1;
+    in-out property <bool> auto-follow: true;
+    in-out property <string> headline: "正在初始化…";
+
+    // ---- 供 Rust 侧挂接的动作 ----
+    callback add-rule();
+    callback remove-selected();
+    callback rescan();
+    callback apply-now();
+    callback toggle-auto-follow(bool);
+    callback restore-all();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: "音频跟随";
+            font-size: 22px;
+            font-weight: 700;
+            color: #16191d;
+        }
+
+        Text {
+            text: root.headline;
+            color: #55606b;
+            wrap: word-wrap;
+        }
+
+        Rectangle { height: 1px; background: #dfe3e8; }
+
+        Text { text: "屏幕 → 音频设备"; font-weight: 600; color: #16191d; }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            ComboBox {
+                model: root.monitor-lines;
+                current-index: root.monitor-index;
+                width: 300px;
+            }
+            ComboBox {
+                model: root.endpoint-lines;
+                current-index: root.endpoint-index;
+                width: 300px;
+            }
+            Button { text: "添加绑定"; clicked => { root.add-rule(); } }
+            Button { text: "删除选中"; clicked => { root.remove-selected(); } }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: #ffffff;
+            border-color: #dfe3e8;
+            border-width: 1px;
+            border-radius: 6px;
+
+            ScrollView {
+                ListView {
+                    for line[index] in root.rule-lines : Rectangle {
+                        height: 32px;
+                        width: parent.width;
+                        background: index == root.selected-rule ? #ffe4d3 : transparent;
+
+                        Text {
+                            x: 12px;
+                            y: 7px;
+                            text: line;
+                            color: #16191d;
+                        }
+                        TouchArea {
+                            clicked => { root.selected-rule = index; }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text { text: "运行日志"; font-weight: 600; color: #16191d; }
+
+        Rectangle {
+            height: 150px;
+            background: #10141a;
+            border-radius: 6px;
+
+            ScrollView {
+                ListView {
+                    for line[index] in root.log-lines : Text {
+                        height: 18px;
+                        text: line;
+                        color: #cfe3ff;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            CheckBox {
+                text: "自动跟随（窗口移到哪块屏，就改到那块屏的设备）";
+                checked: root.auto-follow;
+                toggled => {
+                    root.auto-follow = self.checked;
+                    root.toggle-auto-follow(self.checked);
+                }
+            }
+
+            Button { text: "重新扫描设备"; clicked => { root.rescan(); } }
+            Button { text: "立即应用"; clicked => { root.apply-now(); } }
+            Button { text: "还原全部改动"; clicked => { root.restore-all(); } }
+        }
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "audiofollow"
+description = "常驻托盘，让应用的声音跟随窗口所在的屏幕"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "audiofollow"
+path = "src/main.rs"
+
+[dependencies]
+af-core = { path = "../af-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slint = "1.18"
+tray-icon = "0.26"
+tao = "0.37"
+
+[build-dependencies]
+slint-build = "1.18"
