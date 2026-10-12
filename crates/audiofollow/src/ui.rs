@@ -75,7 +75,7 @@ struct AppState {
     monitors: Vec<Monitor>,
     endpoints: Vec<AudioEndpoint>,
     reconciler: Reconciler,
-    log: Vec<String>,
+    log: Vec<LogRow>,
     last_sync: Instant,
     /// 不直接用，靠 Drop 保证托盘句柄活着。
     _tray: tray::TrayHandle,
@@ -95,10 +95,11 @@ struct AppState {
     last_action: HashMap<u32, Action>,
 
     // 下面几个是为了**只在内容变化时**才把模型推给界面。
-    // 如果每 100ms 重建一次 ComboBox 的 model，用户正在选的那一项会被冲掉。
+    // 如果每 100ms 重建一次下拉框的 model，用户正在选的那一项会被冲掉。
     pushed_monitors: Vec<String>,
     pushed_endpoints: Vec<String>,
-    pushed_rules: Vec<String>,
+    /// 绑定行的签名（monitor, endpoint, enabled）。比较用，避免重建 model。
+    pushed_rules: Vec<(String, String, bool)>,
     pushed_log_len: usize,
 }
 
@@ -137,9 +138,10 @@ impl AppState {
     }
 
     fn log(&mut self, msg: impl Into<String>) {
-        let line = format!("{}  {}", win::now_hms(), msg.into());
-        println!("{line}");
-        self.log.push(line);
+        let time = win::now_hms();
+        let msg = msg.into();
+        println!("{time}  {msg}");
+        self.log.push(LogRow { time: time.into(), msg: msg.into() });
         if self.log.len() > LOG_LIMIT {
             let drop = self.log.len() - LOG_LIMIT;
             self.log.drain(0..drop);
@@ -538,28 +540,56 @@ impl AppState {
             ui.set_endpoint_lines(to_model(el));
         }
 
-        // 绑定列表按**当前实际扫到的显示器**解析，这样「显示器 N」的编号
-        // 和上面的下拉框始终一致
-        let rl: Vec<String> = self
+        // 绑定行按**当前实际扫到的显示器**解析展示名，这样「显示器 N」的编号
+        // 和上面的下拉框始终一致。屏幕不在线时如实标注，而不是悄悄消失。
+        let rows: Vec<RuleRow> = self
             .config
             .rules
             .iter()
-            .enumerate()
-            .map(|(i, r)| format!("{}. {}", i + 1, r.describe_in(&self.monitors)))
+            .map(|r| {
+                let monitor = self
+                    .monitors
+                    .iter()
+                    .enumerate()
+                    .find(|(_, m)| m.device == r.monitor_device)
+                    // label(i) 是完整信息（编号 · 分辨率 · 主屏标记），和下拉框一致
+                    .map(|(i, m)| m.label(i))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}（不在线）",
+                            win::monitor::name_from_device(&r.monitor_device)
+                        )
+                    });
+                let endpoint = if r.endpoint_name.is_empty() {
+                    r.endpoint_id.clone()
+                } else {
+                    r.endpoint_name.clone()
+                };
+                RuleRow {
+                    monitor: monitor.into(),
+                    endpoint: endpoint.into(),
+                    enabled: r.enabled,
+                }
+            })
             .collect();
-        if rl != self.pushed_rules {
-            self.pushed_rules = rl.clone();
-            ui.set_rule_lines(to_model(rl));
+        let sig: Vec<(String, String, bool)> = rows
+            .iter()
+            .map(|r| (r.monitor.to_string(), r.endpoint.to_string(), r.enabled))
+            .collect();
+        if sig != self.pushed_rules {
+            self.pushed_rules = sig;
+            ui.set_rules(slint::ModelRc::new(slint::VecModel::from(rows)));
         }
 
         if self.log.len() != self.pushed_log_len {
             self.pushed_log_len = self.log.len();
-            ui.set_log_lines(to_model(self.log.clone()));
+            ui.set_log_entries(slint::ModelRc::new(slint::VecModel::from(self.log.clone())));
         }
 
         ui.set_headline(self.headline().into());
         ui.set_auto_follow(self.config.auto_follow);
         ui.set_event_driven(self.config.event_driven);
+        ui.set_hook_live(self.hook.is_some());
     }
 }
 
@@ -592,11 +622,15 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
         let w = ui.as_weak();
         ui.on_add_rule(move || {
             let Some(ui) = w.upgrade() else { return };
-            let mi = ui.get_monitor_index().max(0) as usize;
-            let ei = ui.get_endpoint_index().max(0) as usize;
+            let mi = ui.get_monitor_index();
+            let ei = ui.get_endpoint_index();
             let mut s = st.borrow_mut();
-            let msg = s.add_rule(mi, ei);
-            s.log(msg);
+            if mi < 0 || ei < 0 {
+                s.log("请先在上方选择屏幕和音频设备");
+            } else {
+                let msg = s.add_rule(mi as usize, ei as usize);
+                s.log(msg);
+            }
             s.sync_to_ui(&ui);
         });
     }
@@ -604,17 +638,14 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
     {
         let st = state.clone();
         let w = ui.as_weak();
-        ui.on_remove_selected(move || {
+        ui.on_remove_rule(move |idx| {
             let Some(ui) = w.upgrade() else { return };
-            let idx = ui.get_selected_rule();
             let mut s = st.borrow_mut();
             if idx < 0 {
-                s.log("请先在列表里点一条绑定再删除");
-            } else {
-                let msg = s.remove_rule(idx as usize);
-                s.log(msg);
-                ui.set_selected_rule(-1);
+                return;
             }
+            let msg = s.remove_rule(idx as usize);
+            s.log(msg);
             s.sync_to_ui(&ui);
         });
     }

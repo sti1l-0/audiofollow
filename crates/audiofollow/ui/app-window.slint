@@ -1,31 +1,224 @@
-// AudioFollow 设置窗口
+// AudioFollow 设置窗口 —— 控件全部手绘,不依赖 std-widgets 的默认外观。
 //
-// 这里的界面刻意保持简单：一张「屏幕 → 设备」的绑定列表 + 几个按钮 + 一块日志。
-// 项目本身的 UI 只有这一屏，不需要引入 Web 技术栈。
+// 为什么不用 std-widgets 的 Button/CheckBox/ComboBox：它们按"桌面原生"风格渲染,
+// 在本主题下灰暗、密度失衡(下拉框和背景糊在一起、勾选框文字发虚)。
+// 这里自绘 Switch / AppButton / Dropdown,hover/按下/禁用的状态反馈都可控。
+//
+// 日志区刻意保持深色终端风:它是排查工具,不是内容展示,和浅色卡片拉开层次。
 
-import { Button, CheckBox, ComboBox, ListView, ScrollView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
+
+// ---------- 界面用数据结构 ----------
+
+export struct RuleRow {
+    monitor: string,
+    endpoint: string,
+    enabled: bool,
+}
+
+export struct LogRow {
+    time: string,
+    msg: string,
+}
+
+// ---------- 主题 ----------
+
+export global Theme {
+    out property <color> bg: #edf0f5;
+    out property <color> card: #ffffff;
+    out property <color> border: #e2e7ef;
+    out property <color> hover-row: #f4f7fb;
+    out property <color> text: #1b2434;
+    out property <color> text-2: #5b6a80;
+    out property <color> text-3: #98a4b6;
+    out property <color> accent: #3565e3;
+    out property <color> accent-hover: #2a55c6;
+    out property <color> accent-soft: #e9effd;
+    out property <color> danger: #d03050;
+    out property <color> danger-soft: #fbeaee;
+    out property <color> ok: #18a058;
+    out property <color> log-bg: #111a2b;
+    out property <color> log-time: #55708f;
+    out property <color> log-text: #c6d6ea;
+}
+
+// ---------- 手绘控件 ----------
+
+// 滑动开关。
+component Switch inherits Rectangle {
+    in-out property <bool> checked: false;
+    callback toggled(bool);
+
+    width: 36px;
+    height: 20px;
+    border-radius: self.height / 2;
+    background: self.checked ? Theme.accent : #c6d0df;
+    animate background { duration: 150ms; }
+
+    Rectangle {
+        // 滑块
+        x: parent.checked ? parent.width - self.width - 2px : 2px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: self.width / 2;
+        background: white;
+        animate x { duration: 150ms; easing: ease-out; }
+    }
+
+    TouchArea {
+        clicked => {
+            parent.checked = !parent.checked;
+            parent.toggled(parent.checked);
+        }
+    }
+}
+
+// 按钮。primary = 实心主色,danger = 实心红,两者都不设 = 白底描边。
+component AppButton inherits Rectangle {
+    in property <string> text: "按钮";
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 32px;
+    min-width: 92px;
+    border-radius: 8px;
+    background: !self.enabled ? #dee3ec
+        : ta.has-hover ? (danger ? #bb2847 : primary ? Theme.accent-hover : #eef2f8)
+        : (danger ? Theme.danger : primary ? Theme.accent : Theme.card);
+    border-width: primary || danger || !self.enabled ? 0 : 1px;
+    border-color: Theme.border;
+    animate background { duration: 110ms; }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.text;
+        font-size: 13px;
+        font-weight: root.primary || root.danger ? 600 : 500;
+        color: !root.enabled ? #9aa5b5
+            : (root.primary || root.danger ? white : Theme.text);
+    }
+}
+
+// 下拉框。显示当前选中项,点击弹出浮层列表。
+// PopupWindow 而不是内嵌展开:内嵌会把下面的内容挤下去,顶层浮层才对。
+component Dropdown inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index: -1;
+    in property <string> placeholder: "请选择";
+    callback select(int);
+
+    height: 34px;
+    min-width: 170px;
+    border-radius: 8px;
+    background: Theme.card;
+    border-width: 1px;
+    border-color: ta.has-hover ? #c3cfe1 : Theme.border;
+    animate border-color { duration: 110ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { list-popup.show(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 6px;
+
+        Text {
+            // "▾" 在默认字体里没有字形（渲染成豆腐块），改用 Path 画三角
+            text: root.current-index >= 0 && root.current-index < root.model.length
+                ? root.model[root.current-index]
+                : root.placeholder;
+            font-size: 13px;
+            color: root.current-index >= 0 ? Theme.text : Theme.text-3;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Path {
+            width: 9px;
+            height: 6px;
+            viewbox-width: 9;
+            viewbox-height: 6;
+            commands: "M 0 0 L 9 0 L 4.5 6 Z";
+            fill: Theme.text-3;
+        }
+    }
+
+    list-popup := PopupWindow {
+        y: root.height + 6px;
+        width: root.width;
+        height: min(root.model.length * 30px + 12px, 236px);
+
+        Rectangle {
+            background: Theme.card;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            VerticalLayout {
+                padding: 6px;
+                ListView {
+                    for item[index] in root.model : Rectangle {
+                        height: 30px;
+                        border-radius: 6px;
+                        background: index == root.current-index ? Theme.accent-soft
+                            : opt.has-hover ? #f1f4f9 : transparent;
+                        Text {
+                            x: 10px;
+                            width: parent.width - 18px;
+                            text: item;
+                            font-size: 13px;
+                            color: index == root.current-index ? Theme.accent : Theme.text;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        opt := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.current-index = index;
+                                root.select(index);
+                                list-popup.close();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- 主窗口 ----------
 
 export component AppWindow inherits Window {
-    title: "音频跟随 · 设置";
-    width: 820px;
-    height: 600px;
-    background: #f6f7f9;
+    title: "音频跟随";
+    width: 880px;
+    height: 640px;
+    background: Theme.bg;
 
-    // ---- 供 Rust 侧读写的数据 ----
+    // ---- Rust 侧读写的数据 ----
     in-out property <[string]> monitor-lines: [];
     in-out property <[string]> endpoint-lines: [];
-    in-out property <[string]> rule-lines: [];
-    in-out property <[string]> log-lines: [];
-    in-out property <int> monitor-index: 0;
-    in-out property <int> endpoint-index: 0;
-    in-out property <int> selected-rule: -1;
+    in-out property <[RuleRow]> rules: [];
+    in-out property <[LogRow]> log-entries: [];
+    in-out property <int> monitor-index: -1;
+    in-out property <int> endpoint-index: -1;
     in-out property <bool> auto-follow: true;
     in-out property <bool> event-driven: true;
+    in-out property <bool> hook-live: false;
     in-out property <string> headline: "正在初始化…";
 
-    // ---- 供 Rust 侧挂接的动作 ----
+    // ---- Rust 侧挂接的动作 ----
     callback add-rule();
-    callback remove-selected();
+    callback remove-rule(int);
     callback rescan();
     callback apply-now();
     callback toggle-auto-follow(bool);
@@ -33,117 +226,331 @@ export component AppWindow inherits Window {
     callback restore-all();
 
     VerticalLayout {
-        padding: 16px;
-        spacing: 10px;
+        padding: 20px;
+        padding-top: 16px;
+        spacing: 12px;
 
-        Text {
-            text: "音频跟随";
-            font-size: 22px;
-            font-weight: 700;
-            color: #16191d;
-        }
-
-        Text {
-            text: root.headline;
-            color: #55606b;
-            wrap: word-wrap;
-        }
-
-        Rectangle { height: 1px; background: #dfe3e8; }
-
-        Text { text: "屏幕 → 音频设备"; font-weight: 600; color: #16191d; }
-
+        // ================= 标题栏 =================
         HorizontalLayout {
-            spacing: 8px;
+            spacing: 12px;
 
-            ComboBox {
-                model: root.monitor-lines;
-                current-index: root.monitor-index;
-                width: 300px;
+            Rectangle {
+                // 音波图标:三根白色圆角竖条
+                width: 38px;
+                height: 38px;
+                border-radius: 11px;
+                background: Theme.accent;
+                Rectangle { x: 11px; y: 13px; width: 3px; height: 7px;  border-radius: 2px; background: rgba(255,255,255,0.5); }
+                Rectangle { x: 17px; y: 9px;  width: 3px; height: 15px; border-radius: 2px; background: white; }
+                Rectangle { x: 23px; y: 12px; width: 3px; height: 10px; border-radius: 2px; background: rgba(255,255,255,0.75); }
             }
-            ComboBox {
-                model: root.endpoint-lines;
-                current-index: root.endpoint-index;
-                width: 300px;
-            }
-            Button { text: "添加绑定"; clicked => { root.add-rule(); } }
-            Button { text: "删除选中"; clicked => { root.remove-selected(); } }
-        }
 
-        Rectangle {
-            vertical-stretch: 1;
-            background: #ffffff;
-            border-color: #dfe3e8;
-            border-width: 1px;
-            border-radius: 6px;
-
-            ScrollView {
-                ListView {
-                    for line[index] in root.rule-lines : Rectangle {
-                        height: 32px;
-                        width: parent.width;
-                        background: index == root.selected-rule ? #ffe4d3 : transparent;
-
-                        Text {
-                            x: 12px;
-                            y: 7px;
-                            text: line;
-                            color: #16191d;
-                        }
-                        TouchArea {
-                            clicked => { root.selected-rule = index; }
-                        }
-                    }
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "音频跟随";
+                    font-size: 19px;
+                    font-weight: 800;
+                    color: Theme.text;
                 }
-            }
-        }
-
-        Text { text: "运行日志"; font-weight: 600; color: #16191d; }
-
-        Rectangle {
-            height: 150px;
-            background: #10141a;
-            border-radius: 6px;
-
-            ScrollView {
-                ListView {
-                    for line[index] in root.log-lines : Text {
-                        height: 18px;
-                        text: line;
-                        color: #cfe3ff;
-                        font-size: 12px;
-                    }
-                }
-            }
-        }
-
-        VerticalLayout {
-            spacing: 6px;
-
-            CheckBox {
-                text: "自动跟随（窗口移到哪块屏，就改到那块屏的设备）";
-                checked: root.auto-follow;
-                toggled => {
-                    root.auto-follow = self.checked;
-                    root.toggle-auto-follow(self.checked);
+                Text {
+                    text: root.headline;
+                    font-size: 12px;
+                    color: Theme.text-2;
+                    overflow: elide;
                 }
             }
 
             HorizontalLayout {
                 spacing: 8px;
+                Text {
+                    text: "自动跟随";
+                    font-size: 13px;
+                    color: Theme.text-2;
+                    vertical-alignment: center;
+                }
+                Switch {
+                    checked <=> root.auto-follow;
+                    toggled(on) => { root.toggle-auto-follow(on); }
+                }
+            }
+        }
 
-                CheckBox {
-                    text: "实时事件驱动";
-                    checked: root.event-driven;
-                    toggled => {
-                        root.event-driven = self.checked;
-                        root.toggle-event-driven(self.checked);
+        // ================= 绑定卡片 =================
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.card;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    Text {
+                        text: "屏幕 → 音频设备";
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: root.rules.length + " 条绑定";
+                        font-size: 12px;
+                        color: Theme.text-3;
+                        vertical-alignment: center;
                     }
                 }
 
-                Button { text: "重新扫描设备"; clicked => { root.rescan(); } }
-                Button { text: "立即应用"; clicked => { root.apply-now(); } }
-                Button { text: "还原全部改动"; clicked => { root.restore-all(); } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Dropdown {
+                        model: root.monitor-lines;
+                        current-index <=> root.monitor-index;
+                        placeholder: "选择屏幕";
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "→";
+                        color: Theme.text-3;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                    Dropdown {
+                        model: root.endpoint-lines;
+                        current-index <=> root.endpoint-index;
+                        placeholder: "选择音频设备";
+                        horizontal-stretch: 1.5;
+                    }
+                    AppButton {
+                        text: "添加绑定";
+                        primary: true;
+                        clicked => { root.add-rule(); }
+                    }
+                }
+
+                // 列表(空时显示引导文案)
+                Rectangle {
+                    vertical-stretch: 1;
+
+                    if root.rules.length == 0 : VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+
+                        // 淡蓝底音波图标
+                        Rectangle {
+                            width: 52px;
+                            height: 52px;
+                            border-radius: 16px;
+                            background: Theme.accent-soft;
+                            Rectangle { x: 15px; y: 17px; width: 4px; height: 9px;  border-radius: 2px; background: rgba(53,101,227,0.45); }
+                            Rectangle { x: 23px; y: 12px; width: 4px; height: 19px; border-radius: 2px; background: #3565e3; }
+                            Rectangle { x: 31px; y: 15px; width: 4px; height: 13px; border-radius: 2px; background: rgba(53,101,227,0.7); }
+                        }
+
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "还没有绑定";
+                                font-size: 14px;
+                                font-weight: 600;
+                                color: Theme.text-2;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "从上方选一块屏幕和一台音频设备，点「添加绑定」。\n之后窗口拖到那块屏，它的声音就会切到对应设备。";
+                                font-size: 12px;
+                                color: Theme.text-3;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    if root.rules.length > 0 : ListView {
+                        for r[index] in root.rules : Rectangle {
+                            height: 46px;
+                            border-radius: 7px;
+                            background: row-hover.has-hover ? Theme.hover-row : transparent;
+                            animate background { duration: 100ms; }
+
+                            row-hover := TouchArea { mouse-cursor: default; }
+
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 8px;
+                                spacing: 10px;
+
+                                // 左侧标识条:启用的蓝,停用的灰
+                                Rectangle {
+                                    width: 4px;
+                                    Rectangle {
+                                        y: 12px;
+                                        width: parent.width;
+                                        height: parent.height - 24px;
+                                        border-radius: 2px;
+                                        background: r.enabled ? Theme.accent : #c9d2df;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 1px;
+                                    horizontal-stretch: 1.1;
+                                    // 让两行文字在 46px 行高里垂直居中
+                                    Rectangle { vertical-stretch: 1; }
+                                    Text {
+                                        text: r.monitor;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        color: r.enabled ? Theme.text : Theme.text-3;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: r.endpoint;
+                                        font-size: 12px;
+                                        color: r.enabled ? Theme.text-2 : Theme.text-3;
+                                        overflow: elide;
+                                    }
+                                    Rectangle { vertical-stretch: 1; }
+                                }
+
+                                // 行内删除:hover 变红底。
+                                // "✕" 字符缺字形(渲染成豆腐块),用 Path 画两条线。
+                                Rectangle {
+                                    width: 28px;
+                                    del-ta := TouchArea { mouse-cursor: pointer; }
+                                    Rectangle {
+                                        width: 22px;
+                                        height: 22px;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 6px;
+                                        background: del-ta.has-hover ? Theme.danger-soft : transparent;
+                                        animate background { duration: 100ms; }
+                                        Path {
+                                            width: 10px;
+                                            height: 10px;
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            viewbox-width: 10;
+                                            viewbox-height: 10;
+                                            commands: "M 1.5 1.5 L 8.5 8.5 M 8.5 1.5 L 1.5 8.5";
+                                            stroke: del-ta.has-hover ? Theme.danger : Theme.text-3;
+                                            stroke-width: 1.4px;
+                                            stroke-line-cap: round;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= 日志卡片(深色终端风) =================
+        Rectangle {
+            height: 170px;
+            background: Theme.log-bg;
+            border-radius: 10px;
+            clip: true;
+
+            VerticalLayout {
+                padding: 12px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        // 钩子状态点:绿 = 事件钩子在跑
+                        text: "●";
+                        font-size: 10px;
+                        color: root.hook-live ? Theme.ok : #5b6c86;
+                        vertical-alignment: center;
+                        width: 14px;
+                    }
+                    Text {
+                        text: "运行日志";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #8ca2c0;
+                        vertical-alignment: center;
+                    }
+                }
+
+                ListView {
+                    // 始终钉在底部:日志要的是"看到最新的"。
+                    // content-height ≥ height 时取 0,否则取 -(溢出量)。
+                    content-y: min(0, self.height - self.content-height);
+                    for e in root.log-entries : HorizontalLayout {
+                        height: 19px;
+                        spacing: 8px;
+                        Text {
+                            text: e.time;
+                            color: Theme.log-time;
+                            font-size: 12px;
+                            width: 64px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: e.msg;
+                            color: Theme.log-text;
+                            font-size: 12px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= 底部操作栏 =================
+        HorizontalLayout {
+            spacing: 8px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "实时事件驱动";
+                    font-size: 13px;
+                    color: Theme.text-2;
+                    vertical-alignment: center;
+                }
+                Switch {
+                    checked <=> root.event-driven;
+                    toggled(on) => { root.toggle-event-driven(on); }
+                }
+                Text {
+                    text: root.event-driven
+                        ? (root.hook-live ? "已启用 · 约 250ms 响应" : "钩子不可用,已退回轮询")
+                        : "已关闭 · 纯轮询";
+                    font-size: 11px;
+                    color: Theme.text-3;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            AppButton {
+                text: "重新扫描设备";
+                clicked => { root.rescan(); }
+            }
+            AppButton {
+                text: "立即应用";
+                primary: true;
+                clicked => { root.apply-now(); }
+            }
+            AppButton {
+                text: "还原全部改动";
+                danger: true;
+                clicked => { root.restore-all(); }
             }
         }
     }
