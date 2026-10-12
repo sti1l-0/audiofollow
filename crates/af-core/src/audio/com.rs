@@ -15,6 +15,8 @@ pub type HRESULT = i32;
 
 /// `CoInitializeEx` 的 `COINIT_MULTITHREADED`。
 pub const COINIT_MULTITHREADED: u32 = 0x0;
+/// `CoInitializeEx` 的 `COINIT_APARTMENTTHREADED`。
+pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 /// `CLSCTX_ALL`
 pub const CLSCTX_ALL: u32 = 0x17;
 
@@ -187,22 +189,60 @@ impl Drop for ComPtr {
 
 // ------------------------------------------------------------ COM 生命周期 --
 
+/// COM 套间模型。
+///
+/// 对 Core Audio 的调用本身来说两种都能用，但**必须和同一线程上其它 COM 使用者一致**：
+/// winit（slint 的 Windows 后端）在建窗时会调用 `OleInitialize`，而它在 COM 已被初始化成
+/// MTA 的线程上会直接 panic（`RPC_E_CHANGED_MODE`）。所以任何会开窗的进程都得用 STA。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Apartment {
+    SingleThreaded,
+    Multithreaded,
+}
+
+impl Apartment {
+    fn coinit(self) -> u32 {
+        match self {
+            Apartment::SingleThreaded => COINIT_APARTMENTTHREADED,
+            Apartment::Multithreaded => COINIT_MULTITHREADED,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Apartment::SingleThreaded => "STA（单线程套间）",
+            Apartment::Multithreaded => "MTA（多线程套间）",
+        }
+    }
+}
+
 /// COM 套间初始化守卫。析构时按需 `CoUninitialize`。
 pub struct ComGuard {
     /// 只有 `S_OK` / `S_FALSE` 两种情况下才需要配对的 `CoUninitialize`；
     /// `RPC_E_CHANGED_MODE` 表示别的套间模型已经被占用，此时**不能**反初始化。
     needs_uninit: bool,
     hr: HRESULT,
+    apartment: Apartment,
 }
 
 impl ComGuard {
-    /// 以多线程套间（MTA）初始化当前线程的 COM。
-    pub fn mta() -> Self {
-        let hr = unsafe { ffi::CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED) };
+    /// 按指定套间模型初始化当前线程的 COM。
+    pub fn new(apartment: Apartment) -> Self {
+        let hr = unsafe { ffi::CoInitializeEx(ptr::null_mut(), apartment.coinit()) };
         Self {
             needs_uninit: hr == S_OK || hr == S_FALSE,
             hr,
+            apartment,
         }
+    }
+
+    /// 多线程套间。命令行工具用这个（不涉及任何窗口）。
+    pub fn mta() -> Self {
+        Self::new(Apartment::Multithreaded)
+    }
+
+    pub fn apartment(&self) -> Apartment {
+        self.apartment
     }
 
     pub fn hresult(&self) -> HRESULT {

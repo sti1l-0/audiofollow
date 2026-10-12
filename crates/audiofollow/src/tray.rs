@@ -9,6 +9,7 @@
 use std::time::{Duration, Instant};
 
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::platform::windows::EventLoopBuilderExtWindows;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -48,7 +49,12 @@ pub fn spawn(handler: impl Fn(TrayEvent) + Send + 'static) -> TrayHandle {
     std::thread::Builder::new()
         .name("audiofollow-tray".into())
         .spawn(move || {
-            let event_loop = EventLoopBuilder::<TrayCommand>::with_user_event().build();
+            // tao 默认禁止在主线程之外创建事件循环（跨平台兼容性保护）。
+            // 但这里**必须**放在独立线程：主线程被 slint 的窗口事件循环占着，
+            // 而托盘图标要求所属线程有消息循环。显式声明 any_thread 表明这是有意为之。
+            let event_loop = EventLoopBuilder::<TrayCommand>::with_user_event()
+                .with_any_thread(true)
+                .build();
             let proxy = event_loop.create_proxy();
             if tx.send(proxy).is_err() {
                 return;

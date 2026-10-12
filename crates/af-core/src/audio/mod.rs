@@ -127,9 +127,17 @@ pub struct AudioEnv {
 }
 
 impl AudioEnv {
-    /// 初始化。失败通常意味着：COM 初始化异常、Core Audio 服务不可用，或 IID 不在白名单里。
+    /// 初始化（多线程套间）。命令行工具用这个。
     pub fn init() -> Result<Self, ComError> {
-        let guard = ComGuard::mta();
+        Self::init_in(com::Apartment::Multithreaded)
+    }
+
+    /// 按指定套间模型初始化。
+    ///
+    /// 会开窗的进程必须用 [`com::Apartment::SingleThreaded`]：winit 建窗时调 `OleInitialize`，
+    /// 而它在本线程已是 MTA 的情况下会 panic。
+    pub fn init_in(apartment: com::Apartment) -> Result<Self, ComError> {
+        let guard = ComGuard::new(apartment);
         if !guard.usable() {
             return Err(ComError::new("CoInitializeEx", guard.hresult()));
         }
@@ -139,7 +147,7 @@ impl AudioEnv {
     }
 
     pub fn com_status(&self) -> String {
-        self.guard.describe()
+        format!("{} —— {}", self.guard.apartment().label(), self.guard.describe())
     }
 
     pub fn policy(&self) -> &AudioPolicyConfig {

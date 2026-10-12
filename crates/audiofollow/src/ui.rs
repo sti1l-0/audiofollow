@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
+use af_core::audio::com::Apartment;
 use af_core::audio::endpoint::AudioEndpoint;
 use af_core::audio::AudioEnv;
 use af_core::config::{AppConfig, ScreenRule};
@@ -33,6 +34,8 @@ const MIN_POLL_MS: u64 = 300;
 
 struct AppState {
     config: AppConfig,
+    /// 本进程要用的 COM 套间模型。GUI 进程是 STA —— 见 [`run`] 里的说明。
+    apartment: Apartment,
     env: Option<AudioEnv>,
     env_error: Option<String>,
     monitors: Vec<Monitor>,
@@ -52,10 +55,11 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(tray_handle: tray::TrayHandle) -> Self {
+    fn new(tray_handle: tray::TrayHandle, apartment: Apartment) -> Self {
         let (config, warn) = AppConfig::load();
         let mut me = Self {
             config,
+            apartment,
             env: None,
             env_error: None,
             monitors: Vec::new(),
@@ -103,10 +107,11 @@ impl AppState {
         }
 
         if self.env.is_none() {
-            match AudioEnv::init() {
+            match AudioEnv::init_in(self.apartment) {
                 Ok(env) => {
                     self.log(format!(
-                        "音频接口就绪（运行时发现的 IID = {}）",
+                        "音频接口就绪（{}，运行时发现的 IID = {}）",
+                        self.apartment.label(),
                         env.policy().picked_iid()
                     ));
                     self.env = Some(env);
@@ -380,15 +385,26 @@ impl AppState {
 
 /// 启动界面与常驻逻辑。`dpi` 只用于在日志里如实报告生效的 DPI 模式。
 pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
+    // 必须在创建窗口之前就把 COM 初始化成 **STA**。
+    //
+    // slint 的 Windows 后端是 winit，而 winit 在建窗时会调用 `OleInitialize`。
+    // `OleInitialize` 内部就是 `CoInitializeEx(STA)`，它在"本线程已被初始化成 MTA"的情况下
+    // 会返回 `RPC_E_CHANGED_MODE`，而 winit 对这个返回值是**直接 panic** 的。
+    // 我们自己先以 STA 初始化，`OleInitialize` 随后就会拿到 `S_FALSE`（已初始化过），
+    // 顺利通过。ComGuard 会在进程退出时做配对的反初始化。
+    //
+    // Core Audio 在 STA 下完全可用 —— SoundSwitch 本身就是一个 STA 的 WinForms 程序。
+    let apartment = Apartment::SingleThreaded;
+    let _com = af_core::audio::com::ComGuard::new(apartment);
+
     let (tx, rx) = channel::<TrayEvent>();
     let tray_handle = tray::spawn(move |ev| {
         let _ = tx.send(ev);
     });
 
-    let mut state = AppState::new(tray_handle);
-    state.log(format!("DPI 感知：{}", dpi.as_str()));
-
     let ui = AppWindow::new()?;
+    let mut state = AppState::new(tray_handle, apartment);
+    state.log(format!("DPI 感知：{}", dpi.as_str()));
     let state = Rc::new(RefCell::new(state));
 
     {
