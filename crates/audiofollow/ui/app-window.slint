@@ -200,8 +200,14 @@ component Dropdown inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "音频跟随";
-    width: 880px;
-    height: 640px;
+    // 尺寸必须用 preferred-：直接设 width/height 是"固定尺寸"（min==max），
+    // slint-winit 会判定窗口不可缩放 —— 不给 WS_THICKFRAME、最大化按钮禁用、
+    // 布局锁死在 880x640（resize 后内容不重排、拖边框被弹回）。
+    // preferred- 才是"初始尺寸 + 可弹性伸缩"。
+    preferred-width: 880px;
+    preferred-height: 640px;
+    min-width: 700px;
+    min-height: 560px;
     background: Theme.bg;
 
     // ---- Rust 侧读写的数据 ----

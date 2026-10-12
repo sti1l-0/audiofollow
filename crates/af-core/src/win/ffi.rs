@@ -234,22 +234,14 @@ pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 pub const INVALID_HANDLE_VALUE: isize = -1;
 
 pub const SWP_NOSIZE: UINT = 0x0001;
-pub const SWP_NOMOVE: UINT = 0x0002;
 pub const SWP_NOZORDER: UINT = 0x0004;
 pub const SWP_NOACTIVATE: UINT = 0x0010;
-/// 让系统重算非客户区（改窗口样式后必须发一次，否则边框不刷新）。
-pub const SWP_FRAMECHANGED: UINT = 0x0020;
 
 // -------------------------------------------------------------------- 常量 ----
 
 pub const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
 
-pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
-/// 可拖边框缩放。winit 建窗时不带这个位，窗口只能移动不能改大小。
-pub const WS_THICKFRAME: i64 = 0x0004_0000;
-/// 最大化按钮可用（没有它标题栏的最大化是灰的）。
-pub const WS_MAXIMIZEBOX: i64 = 0x0001_0000;
 pub const WS_EX_TOOLWINDOW: i64 = 0x0000_0080;
 pub const WS_EX_APPWINDOW: i64 = 0x0004_0000;
 pub const GW_OWNER: u32 = 4;
@@ -316,7 +308,6 @@ extern "system" {
     pub fn GetWindow(hwnd: HWND, uCmd: UINT) -> HWND;
     pub fn GetWindowRect(hwnd: HWND, lpRect: *mut Rect) -> BOOL;
     pub fn GetWindowLongW(hwnd: HWND, nIndex: i32) -> LONG;
-    pub fn SetWindowLongW(hwnd: HWND, nIndex: i32, dwNewLong: LONG) -> LONG;
 
     pub fn SetProcessDPIAware() -> BOOL;
     /// `value` 取 `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`（即 -4）。
