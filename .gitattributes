@@ -1,0 +1,8 @@
+# 统一换行符，避免 Windows 上提交进来的 CRLF 在别人机器上造成整文件 diff
+* text=auto eol=lf
+
+# 二进制文件不做转换
+*.png binary
+*.ico binary
+*.exe binary
+*.zip binary

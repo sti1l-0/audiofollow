@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/af-core", "crates/audiofollow"]
+# 可行性验证用的 spike 是独立小工程，不纳入 workspace（避免拉高整体构建时间）
+exclude = ["spikes/com-spike", "spikes/tray-spike", "reference"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["sti1l"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# 托盘常驻程序：优先体积与稳定性，放开 LTO
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
