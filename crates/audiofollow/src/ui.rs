@@ -3,12 +3,21 @@
 //! 三个线程各司其职：
 //! - **主线程**：slint 的窗口事件循环。界面状态、COM 调用、路由决策都在这里（因此不需要跨线程共享 COM 对象）。
 //! - **托盘线程**：`tao` 消息循环 + `tray-icon`，菜单事件通过 channel 发回主线程。
-//! - 定时器：跑在 slint 的事件循环里，每 100 ms 醒一次，收托盘事件 + 按配置周期做一次差量同步。
+//! - **事件钩子线程**：`SetWinEventHook` 的消息循环，回调只累加一个原子计数。
+//!   见 [`af_core::win::hook`] 关于"为什么必须单独一条线程"的说明。
 //!
-//! 用轮询而不是窗口移动事件，是刻意的取舍：轮询天然兜住"应用重启后路由丢失"，
-//! 也避开了 `SetWinEventHook` 的消息风暴与去抖问题。事件钩子留作后续优化。
+//! # 触发同步的三条路径
+//!
+//! 1. **窗口事件**（主路径）：钩子线程收到事件 → 置脏 → 主线程 100 ms 醒来时发现脏了，
+//!    等手停下来（去抖 250 ms，上限 1 s）再同步。拖动窗口后大约 250 ms 内声音就换了设备。
+//! 2. **托盘菜单**"立即重新应用"。
+//! 3. **兜底轮询**：事件覆盖不到的情况 —— 进程重启、路由被别的程序改掉、
+//!    某个应用刚出声。周期见 [`FALLBACK_POLL_MS`]。
+//!
+//! 关掉事件驱动（配置或界面）就退化成纯轮询，行为与早期版本一致。
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
@@ -19,18 +28,43 @@ use af_core::audio::AudioEnv;
 use af_core::config::{AppConfig, ScreenRule};
 use af_core::plan;
 use af_core::reconcile::{Action, Change, Reconciler};
-use af_core::win::{self, dpi::DpiAwareness, window, Monitor};
+use af_core::win::hook::WindowEventHook;
+use af_core::win::{self, dpi::DpiAwareness, window, Monitor, ProcTree};
 
 use crate::tray::{self, TrayEvent};
 
 slint::include_modules!();
 
-/// 定时器醒来间隔。托盘事件也是在这个节奏里被收走的。
+/// 定时器醒来间隔。托盘事件与窗口事件都是在这个节奏里被收走的。
 const PUMP_MS: u64 = 100;
 /// 日志最多保留多少行。
 const LOG_LIMIT: usize = 400;
 /// 轮询周期下限，防止配置被改成"每秒几百次"。
 const MIN_POLL_MS: u64 = 300;
+/// 事件到达后等多久再同步。
+///
+/// 拖动窗口时 `EVENT_OBJECT_LOCATIONCHANGE` 是**每帧**一条，收到就同步的话
+/// 一次拖动会触发几百轮。每来一条事件就重新计时，等手停下来再动作。
+const DEBOUNCE_MS: u64 = 250;
+/// 去抖的等待上限。
+///
+/// 有些窗口会持续产生事件（动画、标题闪烁）。没有这个上限的话，
+/// 只要事件不断，同步就永远等不到"安静下来"的那一刻。
+const MAX_DEBOUNCE_MS: u64 = 1000;
+/// 事件驱动模式下兜底轮询的周期。
+///
+/// 事件能覆盖"用户摆窗口"，覆盖不了"应用自己重启后路由丢了"或"某个应用刚开始出声"。
+/// 这个周期就是给那几种情况收口的。
+const FALLBACK_POLL_MS: u64 = 4000;
+
+/// 一批待处理的窗口事件。
+#[derive(Debug, Clone, Copy)]
+struct Dirty {
+    /// 这批事件里最早的那个时刻。用来算去抖上限。
+    first: Instant,
+    /// 最新一条事件的时刻。用来算"手停下来多久了"。
+    last: Instant,
+}
 
 struct AppState {
     config: AppConfig,
@@ -46,7 +80,21 @@ struct AppState {
     /// 不直接用，靠 Drop 保证托盘句柄活着。
     _tray: tray::TrayHandle,
 
-    // 下面三个是为了**只在内容变化时**才把模型推给界面。
+    // ---- 事件驱动 ----
+    /// 窗口事件钩子。`None` 表示不可用（退回轮询）。
+    hook: Option<WindowEventHook>,
+    /// 待处理的窗口事件（去抖用）。
+    dirty: Option<Dirty>,
+    /// 累计处理过的事件数，只用于展示。
+    events_total: usize,
+
+    // ---- 计划里的说明，用来在变化时提示一次 ----
+    plan_notes: Vec<String>,
+    logged_notes: Vec<String>,
+    /// 每个进程上一轮的动作。只在动作**发生变化**时打印，避免每轮刷屏。
+    last_action: HashMap<u32, Action>,
+
+    // 下面几个是为了**只在内容变化时**才把模型推给界面。
     // 如果每 100ms 重建一次 ComboBox 的 model，用户正在选的那一项会被冲掉。
     pushed_monitors: Vec<String>,
     pushed_endpoints: Vec<String>,
@@ -68,6 +116,12 @@ impl AppState {
             log: Vec::new(),
             last_sync: Instant::now() - Duration::from_secs(3600),
             _tray: tray_handle,
+            hook: None,
+            dirty: None,
+            events_total: 0,
+            plan_notes: Vec::new(),
+            logged_notes: Vec::new(),
+            last_action: HashMap::new(),
             pushed_monitors: Vec::new(),
             pushed_endpoints: Vec::new(),
             pushed_rules: Vec::new(),
@@ -78,6 +132,7 @@ impl AppState {
         }
         me.log(format!("配置文件：{}", AppConfig::path().display()));
         me.rescan();
+        me.install_hook();
         me
     }
 
@@ -89,6 +144,82 @@ impl AppState {
             let drop = self.log.len() - LOG_LIMIT;
             self.log.drain(0..drop);
         }
+    }
+
+    // ---------------------------------------------------------- 事件驱动 ----
+
+    fn install_hook(&mut self) {
+        if !self.config.event_driven {
+            self.log(format!(
+                "事件驱动已在配置里关闭，使用轮询：{} ms",
+                self.config.poll_ms.max(MIN_POLL_MS)
+            ));
+            return;
+        }
+        match WindowEventHook::install() {
+            Ok(h) => {
+                self.log(format!(
+                    "窗口事件钩子已启用（{} 条），窗口移动后约 {} ms 内响应；\
+                     另有 {} ms 兜底轮询",
+                    h.hooked_count(),
+                    DEBOUNCE_MS,
+                    FALLBACK_POLL_MS
+                ));
+                self.hook = Some(h);
+            }
+            Err(e) => {
+                self.log(format!(
+                    "窗口事件钩子不可用（{e}），退回轮询：{} ms",
+                    self.config.poll_ms.max(MIN_POLL_MS)
+                ));
+            }
+        }
+    }
+
+    /// 收走钩子线程攒下的事件，标记"有事情发生了"。
+    fn pump_events(&mut self) {
+        let Some(hook) = self.hook.as_ref() else { return };
+        let n = hook.take_events();
+        if n == 0 {
+            return;
+        }
+        self.events_total += n;
+        let now = Instant::now();
+        match &mut self.dirty {
+            Some(d) => d.last = now,
+            None => self.dirty = Some(Dirty { first: now, last: now }),
+        }
+    }
+
+    /// 该不该现在同步一次。
+    fn maybe_sync(&mut self) {
+        if !self.config.auto_follow || self.env.is_none() {
+            return;
+        }
+
+        if let Some(d) = self.dirty {
+            let quiet = d.last.elapsed() >= Duration::from_millis(DEBOUNCE_MS);
+            let capped = d.first.elapsed() >= Duration::from_millis(MAX_DEBOUNCE_MS);
+            if quiet || capped {
+                self.dirty = None;
+                self.tick();
+            }
+            // 事件驱动模式下不再叠加兜底轮询：刚同步过，没必要紧接着再来一次
+            return;
+        }
+
+        if self.due_for_fallback() {
+            self.tick();
+        }
+    }
+
+    fn due_for_fallback(&self) -> bool {
+        let period = if self.config.event_driven && self.hook.is_some() {
+            FALLBACK_POLL_MS
+        } else {
+            self.config.poll_ms.max(MIN_POLL_MS)
+        };
+        self.last_sync.elapsed() >= Duration::from_millis(period)
     }
 
     // ---------------------------------------------------------- 设备扫描 ----
@@ -167,36 +298,60 @@ impl AppState {
 
     // ---------------------------------------------------------- 差量同步 ----
 
-    fn due_for_sync(&self) -> bool {
-        self.config.auto_follow
-            && self.env.is_some()
-            && self.last_sync.elapsed() >= Duration::from_millis(self.config.poll_ms.max(MIN_POLL_MS))
-    }
-
     fn reconcile_now(&mut self) -> Vec<Change> {
-        let Some(env) = self.env.as_ref() else {
-            return Vec::new();
-        };
+        // 进程树与会话列表每轮都要重新拍：窗口一拖、进程一起一落就变了。
         let windows = window::enumerate_app_windows();
-        let p = plan::build(
-            &self.config,
-            &self.monitors,
-            &windows,
-            &self.endpoints,
-            std::process::id(),
-        );
-        let roles = self.config.roles.clone();
-        self.reconciler.apply(env, &p, &roles)
+        let tree = ProcTree::snapshot();
+
+        let (notes, changes) = {
+            let Some(env) = self.env.as_ref() else {
+                return Vec::new();
+            };
+            let sessions = env.session_pids();
+            let held: HashSet<u32> = sessions.iter().copied().collect();
+            let p = plan::build(&plan::Inputs {
+                config: &self.config,
+                monitors: &self.monitors,
+                windows: &windows,
+                endpoints: &self.endpoints,
+                tree: &tree,
+                sessions: &sessions,
+                self_pid: std::process::id(),
+            });
+            let roles = self.config.roles.clone();
+            let changes = self.reconciler.apply(env, &p, &roles, &held);
+            (p.notes, changes)
+        };
+
+        self.plan_notes = notes;
+        changes
     }
 
-    /// 跑一轮同步，只把"有实质动作"的变化写进日志（否则每 1.5 秒刷屏一次）。
+    /// 跑一轮同步。
+    ///
+    /// 只把"动作发生了变化"的行写进日志：每次同步都会对每个目标进程产生一行
+    /// `Unchanged`，全打出来就是每几秒刷屏一次。
     fn tick(&mut self) {
         self.last_sync = Instant::now();
         let changes = self.reconcile_now();
+
         for c in changes {
-            if c.action != Action::Unchanged {
-                self.log(c.line());
+            let prev = self.last_action.insert(c.pid, c.action);
+            if c.action == Action::Unchanged || prev == Some(c.action) {
+                continue;
             }
+            self.log(c.line());
+        }
+
+        // 计划里的说明只在"出现新说明"时提示一次
+        let notes = self.plan_notes.clone();
+        if notes != self.logged_notes {
+            for n in &notes {
+                if !self.logged_notes.contains(n) {
+                    self.log(format!("说明：{n}"));
+                }
+            }
+            self.logged_notes = notes;
         }
     }
 
@@ -230,6 +385,9 @@ impl AppState {
         self.config.remove_rule_for_monitor(&device);
         let saved = self.config.save().map(|_| ()).map_err(|e| e.to_string());
         self.last_sync = Instant::now() - Duration::from_secs(3600);
+        // 绑定少了之后，原先被改道的进程需要还原。清掉去重记录，
+        // 让下一轮如实报告它们的新动作。
+        self.last_action.clear();
         match saved {
             Ok(()) => format!("已删除绑定：{desc}（该屏上的应用会被还原）"),
             Err(e) => format!("已删除绑定：{desc}，但保存失败：{e}"),
@@ -248,6 +406,31 @@ impl AppState {
         }
     }
 
+    fn set_event_driven(&mut self, on: bool) -> String {
+        if self.config.event_driven == on {
+            return format!("事件驱动已经是{}状态", if on { "开启" } else { "关闭" });
+        }
+        self.config.event_driven = on;
+        if on {
+            if self.hook.is_none() {
+                self.install_hook();
+            }
+        } else {
+            // Drop 会 PostThreadMessage(WM_QUIT) 停掉钩子线程
+            self.hook = None;
+            self.dirty = None;
+            self.log(format!(
+                "已切换到纯轮询：{} ms",
+                self.config.poll_ms.max(MIN_POLL_MS)
+            ));
+        }
+        self.last_sync = Instant::now() - Duration::from_secs(3600);
+        match self.config.save() {
+            Ok(_) => String::new(), // install_hook 已经打过日志了
+            Err(e) => format!("保存配置失败：{e}"),
+        }
+    }
+
     fn restore_all(&mut self) -> String {
         let Some(env) = self.env.as_ref() else {
             return "音频接口不可用，无法还原".into();
@@ -258,6 +441,7 @@ impl AppState {
         for c in &changes {
             println!("[还原] {}", c.line());
         }
+        self.last_action.clear();
         let leftovers = self.reconciler.leftovers().to_vec();
         if leftovers.is_empty() {
             format!("已还原 {done} 个进程的音频路由")
@@ -303,12 +487,20 @@ impl AppState {
         if let Some(err) = &self.env_error {
             return format!("音频接口不可用：{err}");
         }
+        let trigger = if self.hook.is_some() {
+            "实时事件驱动".to_string()
+        } else if self.config.event_driven {
+            format!("事件钩子不可用，轮询 {} ms", self.config.poll_ms.max(MIN_POLL_MS))
+        } else {
+            format!("轮询 {} ms", self.config.poll_ms.max(MIN_POLL_MS))
+        };
         format!(
-            "{} 块显示器 · {} 个音频输出设备 · {} 条绑定 · 当前已改道 {} 个进程{}",
+            "{} 块显示器 · {} 个音频输出设备 · {} 条绑定 · 已改道 {} 个进程 · {}{}",
             self.monitors.len(),
             self.endpoints.len(),
             self.config.rules.len(),
             self.reconciler.tracked(),
+            trigger,
             if self.config.auto_follow {
                 ""
             } else {
@@ -346,27 +538,14 @@ impl AppState {
             ui.set_endpoint_lines(to_model(el));
         }
 
+        // 绑定列表按**当前实际扫到的显示器**解析，这样「显示器 N」的编号
+        // 和上面的下拉框始终一致
         let rl: Vec<String> = self
             .config
             .rules
             .iter()
             .enumerate()
-            .map(|(i, r)| {
-                format!(
-                    "{}. {}  →  {}",
-                    i + 1,
-                    if r.monitor_name.is_empty() {
-                        r.monitor_device.trim_start_matches(r"\\.\").to_string()
-                    } else {
-                        r.monitor_name.clone()
-                    },
-                    if r.endpoint_name.is_empty() {
-                        r.endpoint_id.clone()
-                    } else {
-                        r.endpoint_name.clone()
-                    }
-                )
-            })
+            .map(|(i, r)| format!("{}. {}", i + 1, r.describe_in(&self.monitors)))
             .collect();
         if rl != self.pushed_rules {
             self.pushed_rules = rl.clone();
@@ -380,6 +559,7 @@ impl AppState {
 
         ui.set_headline(self.headline().into());
         ui.set_auto_follow(self.config.auto_follow);
+        ui.set_event_driven(self.config.event_driven);
     }
 }
 
@@ -477,6 +657,20 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
     {
         let st = state.clone();
         let w = ui.as_weak();
+        ui.on_toggle_event_driven(move |on| {
+            let Some(ui) = w.upgrade() else { return };
+            let mut s = st.borrow_mut();
+            let msg = s.set_event_driven(on);
+            if !msg.is_empty() {
+                s.log(msg);
+            }
+            s.sync_to_ui(&ui);
+        });
+    }
+
+    {
+        let st = state.clone();
+        let w = ui.as_weak();
         ui.on_restore_all(move || {
             let Some(ui) = w.upgrade() else { return };
             let mut s = st.borrow_mut();
@@ -501,9 +695,8 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
                 while let Ok(ev) = rx.try_recv() {
                     s.handle_tray(ev, &ui);
                 }
-                if s.due_for_sync() {
-                    s.tick();
-                }
+                s.pump_events();
+                s.maybe_sync();
                 s.sync_to_ui(&ui);
             },
         );

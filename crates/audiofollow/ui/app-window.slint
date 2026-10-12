@@ -20,6 +20,7 @@ export component AppWindow inherits Window {
     in-out property <int> endpoint-index: 0;
     in-out property <int> selected-rule: -1;
     in-out property <bool> auto-follow: true;
+    in-out property <bool> event-driven: true;
     in-out property <string> headline: "正在初始化…";
 
     // ---- 供 Rust 侧挂接的动作 ----
@@ -28,6 +29,7 @@ export component AppWindow inherits Window {
     callback rescan();
     callback apply-now();
     callback toggle-auto-follow(bool);
+    callback toggle-event-driven(bool);
     callback restore-all();
 
     VerticalLayout {
@@ -115,8 +117,8 @@ export component AppWindow inherits Window {
             }
         }
 
-        HorizontalLayout {
-            spacing: 8px;
+        VerticalLayout {
+            spacing: 6px;
 
             CheckBox {
                 text: "自动跟随（窗口移到哪块屏，就改到那块屏的设备）";
@@ -127,9 +129,22 @@ export component AppWindow inherits Window {
                 }
             }
 
-            Button { text: "重新扫描设备"; clicked => { root.rescan(); } }
-            Button { text: "立即应用"; clicked => { root.apply-now(); } }
-            Button { text: "还原全部改动"; clicked => { root.restore-all(); } }
+            HorizontalLayout {
+                spacing: 8px;
+
+                CheckBox {
+                    text: "实时事件驱动";
+                    checked: root.event-driven;
+                    toggled => {
+                        root.event-driven = self.checked;
+                        root.toggle-event-driven(self.checked);
+                    }
+                }
+
+                Button { text: "重新扫描设备"; clicked => { root.rescan(); } }
+                Button { text: "立即应用"; clicked => { root.apply-now(); } }
+                Button { text: "还原全部改动"; clicked => { root.restore-all(); } }
+            }
         }
     }
 }

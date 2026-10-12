@@ -19,12 +19,20 @@
 //!
 //! 因为这是未文档化行为，仍有失败可能，所以还原失败时会记账并在报告里如实说明，
 //! 而不是假装已经清理干净。
+//!
+//! # 多进程应用
+//!
+//! 一次 `apply` 遍历的是计划的**写入清单**（应用根 + 同名后代，见 [`crate::plan`]），
+//! 而不是"一个应用一条"。每个目标进程都有**自己独立的**持久化设置，
+//! 所以备份和记账也必须按目标进程分别做 —— 浏览器的 audio utility 子进程和主进程
+//! 是两条互不相干的记录。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::audio::policy::PersistedRoute;
 use crate::audio::{AudioEnv, Role};
-use crate::plan::Plan;
+use crate::plan::{Plan, PlannedRoute};
+use crate::win::{proc, window};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -71,7 +79,7 @@ impl Change {
 pub struct Reconciler {
     /// pid → 本程序最后成功写入的端点原始 ID。
     applied: HashMap<u32, String>,
-    /// pid → 改动前的原始 ID。`None` 表示原来就是"跟随系统默认"（无法还原）。
+    /// pid → 改动前的原始 ID。`None` 表示原来就是"跟随系统默认"。
     backups: HashMap<u32, Option<String>>,
     /// 因为原值是"跟随系统默认"而无法还原的进程。
     leftovers: Vec<u32>,
@@ -82,9 +90,16 @@ impl Reconciler {
         Self::default()
     }
 
-    /// 当前被本程序改动过的进程数。
+    /// 当前被本程序改动过的进程数（多进程应用会占多个）。
     pub fn tracked(&self) -> usize {
         self.applied.len()
+    }
+
+    /// 被改动过的进程列表，按 pid 升序。
+    pub fn tracked_pids(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.applied.keys().copied().collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn applied_endpoint(&self, pid: u32) -> Option<&str> {
@@ -101,7 +116,18 @@ impl Reconciler {
     }
 
     /// 按计划执行一次差量同步。
-    pub fn apply(&mut self, env: &AudioEnv, plan: &Plan, roles: &[Role]) -> Vec<Change> {
+    ///
+    /// `sessions` 是当前持有音频会话的进程集合。它只用来**避免无效写入**：
+    /// 系统对没有音频会话的进程会静默忽略写入（返回 `PROCESS_NO_AUDIO`），
+    /// 所以对它们不调用接口，也不报告——否则一个 20 进程的浏览器每轮都会刷屏。
+    /// 一旦某个进程真的出声了，下一轮就会被写进去。
+    pub fn apply(
+        &mut self,
+        env: &AudioEnv,
+        plan: &Plan,
+        roles: &[Role],
+        sessions: &HashSet<u32>,
+    ) -> Vec<Change> {
         let mut changes = Vec::new();
         if roles.is_empty() {
             changes.push(Change {
@@ -113,21 +139,35 @@ impl Reconciler {
             return changes;
         }
 
-        let planned: HashMap<u32, &crate::plan::PlannedRoute> =
-            plan.entries.iter().map(|e| (e.pid, e)).collect();
+        let write_list = plan.write_list();
+        let planned: HashSet<u32> = write_list.iter().map(|(p, _, _)| *p).collect();
 
         // ---- 1) 计划里不再出现的进程：把原值还回去 ----
         let mut stale: Vec<u32> = self
             .applied
             .keys()
             .copied()
-            .filter(|p| !planned.contains_key(p))
+            .filter(|p| !planned.contains(p))
             .collect();
         stale.sort_unstable();
 
         for pid in stale {
-            let original = self.backups.get(&pid).cloned().flatten();
+            // 进程已经退出：它那条持久化设置随进程一起没了，不需要（也没法）还原。
+            // 直接把账销掉，否则会一直重试到天荒地老。
+            if !proc::exists(pid) {
+                self.applied.remove(&pid);
+                self.backups.remove(&pid);
+                changes.push(Change {
+                    pid,
+                    who: format!("pid {pid}"),
+                    action: Action::Unrouted,
+                    detail: "进程已退出，无需还原（记录已清除）".into(),
+                });
+                continue;
+            }
+
             let who = self.who(pid);
+            let original = self.backups.get(&pid).cloned().flatten();
             match original {
                 Some(id) => {
                     let outcome = env.route_to_id(pid, &id, roles);
@@ -140,7 +180,7 @@ impl Reconciler {
                             detail: format!("窗口已离开已配置的屏幕，还原为原设备 {id}"),
                         });
                     } else {
-                        // 进程可能已经退出（拿不到音频会话）。保留记录，下轮再试。
+                        // 进程可能暂时拿不到音频会话。保留记录，下轮再试。
                         changes.push(Change {
                             pid,
                             who,
@@ -150,7 +190,6 @@ impl Reconciler {
                     }
                 }
                 None => {
-                    // 原值是"跟随系统默认"。写空字符串即可恢复（实测可用），所以能真正还原干净。
                     let outcome = env.clear_route(pid, roles);
                     if outcome.applied() {
                         self.applied.remove(&pid);
@@ -168,7 +207,7 @@ impl Reconciler {
                             pid,
                             who,
                             action: Action::Deferred,
-                            detail: "恢复为跟随系统默认暂未生效（进程没有音频会话），下轮重试".into(),
+                            detail: "恢复为跟随系统默认暂未生效（进程没有音频会话），下轮重试目前不影响出声".into(),
                         });
                     } else {
                         // 写空值这条路在这个系统版本上没走通。如实记账，不假装修好了。
@@ -191,72 +230,116 @@ impl Reconciler {
             }
         }
 
-        // ---- 2) 按计划下发 ----
+        // ---- 2) 按计划下发（逐目标进程） ----
         for entry in &plan.entries {
-            let already = self
-                .applied_endpoint(entry.pid)
-                .map(|id| id == entry.endpoint.id.as_str())
-                .unwrap_or(false);
-            if already {
-                changes.push(Change {
-                    pid: entry.pid,
-                    who: entry.label(),
-                    action: Action::Unchanged,
-                    detail: format!("已在 {}", entry.endpoint.name),
-                });
-                continue;
-            }
+            // 整个应用（含全部后代）现在都没出声 → 写进去也会被系统忽略。
+            let any_session = entry.targets.iter().any(|p| sessions.contains(p));
+            let already_tracked = entry.targets.iter().any(|p| self.applied.contains_key(p));
 
-            // 第一次改动这个进程之前，把原值记下来
-            if !self.backups.contains_key(&entry.pid) {
-                let original = match env.get_route(entry.pid, roles[0]) {
-                    Ok(PersistedRoute::Pinned(id)) => Some(id),
-                    // NoAudioSession / FollowSystemDefault 都归为"没有单独设置过"
-                    _ => None,
-                };
-                self.backups.insert(entry.pid, original);
-            }
-
-            let outcome = env.route(entry.pid, &entry.endpoint, roles);
-            if outcome.applied() {
-                self.applied.insert(entry.pid, entry.endpoint.id.clone());
-                let mut detail = format!(
-                    "{} → {}（{}）",
-                    entry.monitor_device, entry.endpoint.name, outcome.summary()
-                );
-                if !entry.contested_monitors.is_empty() {
-                    detail.push_str(&format!(
-                        "；该进程在 {:?} 上也有窗口，按面积择大",
-                        entry.contested_monitors
-                    ));
-                }
-                changes.push(Change {
-                    pid: entry.pid,
-                    who: entry.label(),
-                    action: Action::Routed,
-                    detail,
-                });
-            } else if outcome.no_audio_session {
+            if !any_session && !already_tracked {
                 changes.push(Change {
                     pid: entry.pid,
                     who: entry.label(),
                     action: Action::Deferred,
                     detail: format!(
-                        "该进程还没有音频会话，系统未接受写入；下一轮重试（{}）",
+                        "当前没有音频会话，暂未写入；等它出声时自动改道到 {}",
                         entry.endpoint.name
                     ),
                 });
-            } else {
-                changes.push(Change {
-                    pid: entry.pid,
-                    who: entry.label(),
-                    action: Action::Failed,
-                    detail: outcome.summary(),
-                });
+                continue;
+            }
+
+            for &target in &entry.targets {
+                let is_child = target != entry.pid;
+                // 没出声的后代：跳过。它的路由等它出声那一轮再写。
+                if is_child && !sessions.contains(&target) {
+                    continue;
+                }
+                if let Some(c) = self.write_one(env, target, entry, is_child, roles) {
+                    changes.push(c);
+                }
             }
         }
 
         changes
+    }
+
+    /// 把一个目标进程写到计划指定的设备。
+    fn write_one(
+        &mut self,
+        env: &AudioEnv,
+        pid: u32,
+        entry: &PlannedRoute,
+        is_child: bool,
+        roles: &[Role],
+    ) -> Option<Change> {
+        let who = self.who_of(entry, pid, is_child);
+
+        let already = self
+            .applied_endpoint(pid)
+            .map(|id| id == entry.endpoint.id.as_str())
+            .unwrap_or(false);
+        if already {
+            return Some(Change {
+                pid,
+                who,
+                action: Action::Unchanged,
+                detail: format!("已在 {}", entry.endpoint.name),
+            });
+        }
+
+        // 第一次改动这个进程之前，把原值记下来
+        if !self.backups.contains_key(&pid) {
+            let original = match env.get_route(pid, roles[0]) {
+                Ok(PersistedRoute::Pinned(id)) => Some(id),
+                // NoAudioSession / FollowSystemDefault 都归为"没有单独设置过"
+                _ => None,
+            };
+            self.backups.insert(pid, original);
+        }
+
+        let outcome = env.route(pid, &entry.endpoint, roles);
+        if outcome.applied() {
+            self.applied.insert(pid, entry.endpoint.id.clone());
+            let mut detail = format!(
+                "{} → {}（{}）",
+                entry.monitor_device,
+                entry.endpoint.name,
+                outcome.summary()
+            );
+            if is_child {
+                detail.push_str("；多进程应用的后代进程，音频实际由它输出");
+            }
+            if !is_child && !entry.contested_monitors.is_empty() {
+                detail.push_str(&format!(
+                    "；该应用在 {:?} 上也有窗口，按面积择大",
+                    entry.contested_monitors
+                ));
+            }
+            Some(Change {
+                pid,
+                who,
+                action: Action::Routed,
+                detail,
+            })
+        } else if outcome.no_audio_session {
+            Some(Change {
+                pid,
+                who,
+                action: Action::Deferred,
+                detail: format!(
+                    "该进程还没有音频会话，系统未接受写入；下一轮重试（{}）",
+                    entry.endpoint.name
+                ),
+            })
+        } else {
+            Some(Change {
+                pid,
+                who,
+                action: Action::Failed,
+                detail: outcome.summary(),
+            })
+        }
     }
 
     /// 退出前把所有改动还原。
@@ -318,10 +401,46 @@ impl Reconciler {
         changes
     }
 
+    /// 变更行里显示的"这是谁"。后代进程要标清楚归属，否则用户看到一串
+    /// 同名 chrome.exe 会不知道哪条对应哪个应用。
+    fn who_of(&self, entry: &PlannedRoute, pid: u32, is_child: bool) -> String {
+        if !is_child {
+            return entry.label();
+        }
+        let name = window::process_name(pid).unwrap_or_else(|| "?".into());
+        format!("{name} (pid {pid}，{} 的子进程)", entry.label())
+    }
+
     fn who(&self, pid: u32) -> String {
         match crate::win::window::process_name(pid) {
             Some(name) => format!("{name} (pid {pid})"),
             None => format!("pid {pid}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_labels_are_stable() {
+        assert_eq!(Action::Routed.label(), "已改道");
+        assert_eq!(Action::Deferred.label(), "待重试");
+        assert_eq!(Action::Failed.label(), "失败");
+    }
+
+    #[test]
+    fn change_line_reads_naturally() {
+        let c = Change {
+            pid: 42,
+            who: "chrome.exe (pid 42)".into(),
+            action: Action::Routed,
+            detail: r"\\.\DISPLAY2 → 扬声器 B".into(),
+        };
+        assert_eq!(
+            c.line(),
+            r"[已改道] chrome.exe (pid 42) —— \\.\DISPLAY2 → 扬声器 B"
+        );
     }
 }

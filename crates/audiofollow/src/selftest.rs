@@ -12,7 +12,7 @@ use af_core::audio::policy::PersistedRoute;
 use af_core::audio::{AudioEnv, Role};
 use af_core::config::AppConfig;
 use af_core::plan;
-use af_core::win::{self, window};
+use af_core::win::{self, hook::WindowEventHook, window, ProcTree};
 
 fn rule(title: &str) {
     println!();
@@ -40,8 +40,10 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
         println!("  注意            : {w}");
     }
     println!(
-        "  自动跟随        : {}   轮询 {} ms",
-        config.auto_follow, config.poll_ms
+        "  自动跟随        : {}   轮询 {} ms   事件驱动 {}",
+        config.auto_follow,
+        config.poll_ms,
+        if config.event_driven { "开" } else { "关" }
     );
     println!(
         "  接管的音频角色  : {}",
@@ -123,18 +125,18 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
         }
         let mi = window::monitor_index_for(&monitors, w);
         let target = match mi {
-            Some(i) => monitors[i].device.clone(),
+            Some(i) => monitors[i].label(i),
             None => "<无归属>".to_string(),
         };
         let flag = if w.minimized { " [最小化，不参与判定]" } else { "" };
         println!(
-            "  {:>7}  {:<22} {:>12}  {}{}",
+            "  {:>7}  {:<22} {}{}",
             w.pid,
             truncate(&w.exe, 22),
-            target,
-            truncate(&w.display_name(), 46),
+            truncate(&target, 34),
             flag
         );
+        println!("           {}", truncate(&w.display_name(), 60));
         shown += 1;
         if shown >= 25 {
             println!("  ...（仅显示前 25 个窗口）");
@@ -143,26 +145,125 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
     }
     println!("  共 {} 个顶层窗口", windows.len());
 
-    // ---------------- [5] 路由计划 ----------------
-    rule("[5] 路由计划（纯计算，尚未写入）");
-    let p = plan::build(&config, &monitors, &windows, &endpoints, self_pid);
+    // ---------------- [5] 进程树与多进程覆盖 ----------------
+    rule("[5] 进程树与多进程覆盖");
+    let tree = ProcTree::snapshot();
+    println!("  快照进程数      : {}", tree.len());
+
+    // 每个"持有窗口的进程"，看它有多少**同名**后代（这些会被一起改道）
+    let mut owners: Vec<(u32, String)> = Vec::new();
+    for w in &windows {
+        if w.pid == self_pid {
+            continue;
+        }
+        if tree.get(w.pid).is_none() {
+            continue;
+        }
+        if !owners.iter().any(|(p, _)| *p == w.pid) {
+            owners.push((w.pid, w.exe.clone()));
+        }
+    }
+    owners.sort_unstable();
+
+    println!();
+    println!("  持有窗口的进程，及其同名后代（同名的会被一起改道）：");
+    for (pid, exe) in &owners {
+        let same: Vec<u32> = tree
+            .descendants(*pid)
+            .into_iter()
+            .filter(|d| tree.exe_of(*d) == Some(exe.as_str()))
+            .collect();
+        let other = tree.descendants(*pid).len() - same.len();
+        let child = format!(
+            "同名后代 {} 个{}",
+            same.len(),
+            if other > 0 {
+                format!("（另有 {other} 个异名后代，**不会**被改道）")
+            } else {
+                String::new()
+            }
+        );
+        println!("    {:<22} pid={:<7} {}", truncate(exe, 22), pid, child);
+        if !same.is_empty() {
+            let head: Vec<String> = same.iter().take(8).map(|p| p.to_string()).collect();
+            println!(
+                "        目标进程：pid {}{}",
+                head.join(", "),
+                if same.len() > head.len() {
+                    format!(" … 等 {} 个", same.len())
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+
+    // 谁在出声，以及它会不会被改道覆盖到
+    println!();
+    println!("  正在出声的进程，是否落在某个窗口进程的同名子树里：");
+    let sessions = env.session_pids();
+    if sessions.is_empty() {
+        println!("    （当前没有音频会话——放点声音再跑一次就能看到）");
+    }
+    for pid in &sessions {
+        if *pid == self_pid {
+            continue;
+        }
+        let name = tree
+            .exe_of(*pid)
+            .map(str::to_string)
+            .or_else(|| window::process_name(*pid))
+            .unwrap_or_else(|| "?".into());
+        // 找到持有它的那个窗口进程
+        let carrier = owners.iter().find(|(op, oexe)| {
+            *oexe == name && (*op == *pid || tree.is_ancestor(*op, *pid))
+        });
+        match carrier {
+            Some((op, _)) => println!(
+                "    {:>7}  {:<22} ✅ 会被改道（挂在窗口进程 pid {op} 的树下）",
+                pid, truncate(&name, 22)
+            ),
+            None => println!(
+                "    {:>7}  {:<22} ⚠️ 不会被接管（与任何窗口进程都不同名，或不在其树下）",
+                pid, truncate(&name, 22)
+            ),
+        }
+    }
+
+    // ---------------- [6] 路由计划 ----------------
+    rule("[6] 路由计划（纯计算，尚未写入）");
+    let p = plan::build(&plan::Inputs {
+        config: &config,
+        monitors: &monitors,
+        windows: &windows,
+        endpoints: &endpoints,
+        tree: &tree,
+        sessions: &sessions,
+        self_pid,
+    });
     if p.is_empty() {
         println!("  计划为空");
     }
     for e in &p.entries {
-        println!(
-            "  {:<28} → {} / {}",
-            e.label(),
-            e.monitor_device,
-            e.endpoint.name
-        );
+        println!("  {:<28} → {} / {}", e.label(), e.monitor_device, e.endpoint.name);
         println!("      重叠面积   : {} px²", e.overlap);
         if !e.windows.is_empty() {
             println!("      依据窗口   : {}", e.windows.join(" | "));
         }
+        let kids = e.child_targets();
+        println!(
+            "      写入目标   : {} 个进程（含 {} 个同名后代{}）",
+            e.targets.len(),
+            kids.len(),
+            if kids.is_empty() {
+                String::new()
+            } else {
+                format!("：pid {}", kids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+            }
+        );
         if !e.contested_monitors.is_empty() {
             println!(
-                "      注意       : 该进程在 {:?} 上也有窗口，已按面积择大",
+                "      注意       : 该应用在 {:?} 上也有窗口，已按面积择大",
                 e.contested_monitors
             );
         }
@@ -171,13 +272,12 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
         println!("  说明：{n}");
     }
 
-    // ---------------- [6] 音频会话（诊断） ----------------
-    rule("[6] 当前有音频会话的进程（诊断用，不参与路由决策）");
-    let pids = env.session_pids();
-    if pids.is_empty() {
+    // ---------------- [7] 音频会话（诊断） ----------------
+    rule("[7] 当前有音频会话的进程（诊断用，不参与路由决策）");
+    if sessions.is_empty() {
         println!("  （没有活跃音频会话——放点声音再跑一次就能看到）");
     }
-    for pid in &pids {
+    for pid in &sessions {
         let name = window::process_name(*pid).unwrap_or_else(|| "?".into());
         let sub = match read_role(&env, *pid, Role::Console) {
             Ok(r) => r.describe(),
@@ -186,16 +286,148 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
         println!("  {:>7}  {:<24} 控制音：{}", pid, truncate(&name, 24), sub);
     }
 
-    // ---------------- [7] 可选的写入往返 ----------------
+    // ---------------- [8] 事件钩子 ----------------
+    rule("[8] 窗口事件钩子（实时性）");
+    if let Err(e) = hook_probe(false) {
+        println!("  {e}");
+    }
+
+    // ---------------- [9] 可选的写入往返 ----------------
     if write_test {
-        rule("[7] 写入往返验证（可回滚）");
+        rule("[9] 写入往返验证（可回滚）");
         return write_roundtrip(&env, &endpoints, args);
     }
 
     rule("完成");
     println!("  本次未向系统写入任何内容（只读自检）。");
     println!("  要验证写入路径，运行： audiofollow --write-test");
+    println!("  要单独验证事件钩子，运行： audiofollow --hook-test");
     0
+}
+
+/// 验证事件钩子。
+///
+/// 分两级证据，缺一不可：
+///
+/// - **一级（合成事件）**：`NotifyWinEvent` 造一个事件，证明"钩子装上了、消息循环在泵、
+///   回调被调到了、过滤条件没把事件全滤掉"。
+/// - **二级（真实位移）**：把某个别人的窗口平移 2px 再挪回去，证明"真实的窗口位置变化
+///   确实会产生我们钩到的事件"。一级通但二级不通意味着钩子事件范围选错了。
+///
+/// `allow_jiggle` 为假时只做一级（`--selftest` 用，绝不动别人的窗口）。
+/// 为真时两级都做（`--hook-test` 用）。
+pub fn hook_probe(allow_jiggle: bool) -> Result<(), String> {
+    let hook = WindowEventHook::install()?;
+    println!("  钩子条数        : {}", hook.hooked_count());
+
+    // ---------- 一级：合成事件 ----------
+    let mut synth_ok = false;
+    for ev in [
+        af_core::win::ffi::EVENT_OBJECT_LOCATIONCHANGE,
+        af_core::win::ffi::EVENT_SYSTEM_FOREGROUND,
+    ] {
+        hook.take_events(); // 先清零
+        if !af_core::win::hook::synthesize(ev) {
+            continue;
+        }
+        if wait_for_events(&hook, 500) > 0 {
+            synth_ok = true;
+        }
+    }
+
+    if synth_ok {
+        println!("  ① 合成事件      : ✅ 回调被调用且通过了过滤");
+        println!(
+            "     最近事件      : {}",
+            WindowEventHook::event_name(hook.last_event_id())
+        );
+    } else {
+        println!("  ① 合成事件      : ⚠️ 没收到（合成事件不保证派发给外部上下文的钩子，");
+        println!("                     这不代表真实事件也收不到——见下面二级测试）");
+    }
+
+    if !allow_jiggle {
+        println!("  结论            : 钩子通路已确认；真实位移请运行 audiofollow --hook-test");
+        return Ok(());
+    }
+
+    // ---------- 二级：真实窗口位移 ----------
+    hook.take_events();
+    af_core::win::hook::clear_raw();
+    match af_core::win::hook::jiggle_some_window() {
+        Ok(desc) => {
+            println!("  ② 真实位移      : 已挪动并复原 {desc}");
+            let n = wait_for_events(&hook, 1500);
+            if n > 0 {
+                println!("     -> ✅ 收到 {n} 条事件");
+                println!(
+                    "     最近事件      : {}",
+                    WindowEventHook::event_name(hook.last_event_id())
+                );
+                println!("  结论            : 事件驱动可用。真实窗口移动会触发同步判断，");
+                println!("                    端到端延迟约为去抖时长 250 ms。");
+            } else {
+                println!(
+                    "     -> ❌ 一条都没通过过滤（回调被调用 {} 次）",
+                    hook.total_calls()
+                );
+                dump_raw_events();
+                println!("  结论            : 事件钩子对真实位移无效，程序会自动退回轮询。");
+                return Err("真实窗口位移未产生可接收事件".into());
+            }
+        }
+        Err(e) => {
+            println!("  ② 真实位移      : 跳过（{e}）");
+            println!("  结论            : 只能确认到一级；请手动拖动任意窗口后观察运行日志");
+        }
+    }
+    Ok(())
+}
+
+/// 等到收到事件，或超时。返回收到的事件数。
+///
+/// **不要**写成 `while ... && hook.take_events() == 0 { sleep }` 再在循环外读一次：
+/// `take_events()` 是"取走并清零"语义，条件表达式里那次调用**已经**把计数消费掉了，
+/// 循环外再读必然得到 0 —— 结果就是钩子明明是好的，自检却报"收不到"。
+/// （这个坑真实发生过一次。）
+fn wait_for_events(hook: &WindowEventHook, ms: u64) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let mut got = 0usize;
+    loop {
+        got += hook.take_events();
+        if got > 0 || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// 把环形缓冲里的原始事件参数打出来，用于定位"钩子通着但事件被滤光了"。
+fn dump_raw_events() {
+    let raw = af_core::win::hook::raw_recent();
+    if raw.is_empty() {
+        println!("     原始事件缓冲   : 空——回调一次都没被调用，钩子事件范围可能选错了");
+        return;
+    }
+    println!("     原始事件缓冲   : 最近 {} 条（**未过滤**，这就是定位依据）", raw.len());
+    let mut seen: Vec<(u32, i32, i32)> = Vec::new();
+    for (ev, obj, child) in &raw {
+        let key = (*ev, *obj, *child);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        println!(
+            "        {}  event=0x{ev:04X}  idObject={obj} ({})  idChild={child}",
+            af_core::win::hook::WindowEventHook::event_name(*ev),
+            af_core::win::hook::objid_name(*obj),
+        );
+        if seen.len() >= 6 {
+            println!("        ...（去重后仅显示前 6 种）");
+            break;
+        }
+    }
+    println!("     判读           : 过滤条件是 idObject 必须为 0（OBJID_WINDOW）、idChild 必须为 0。");
 }
 
 fn truncate(s: &str, n: usize) -> String {

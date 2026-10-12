@@ -1,8 +1,9 @@
 //! AudioFollow —— 让应用的声音跟随窗口所在的屏幕。
 //!
-//! 三种运行方式：
-//! - 无参数：常驻托盘 + 设置窗口
+//! 运行方式：
+//! - 无参数：常驻托盘 + 设置窗口（窗口事件驱动，毫秒级响应）
 //! - `--selftest`：只读自检，把整条链路打印出来
+//! - `--hook-test`：单独验证窗口事件钩子通不通（必要时会挪动一个窗口 2px 再复原）
 //! - `--write-test [pid]`：在单个进程上做可回滚的写入往返验证
 
 mod selftest;
@@ -24,6 +25,13 @@ fn main() {
     let code = match cmd {
         "--selftest" | "selftest" => selftest::run(false, &args),
         "--write-test" | "write-test" => selftest::run(true, &args),
+        "--hook-test" | "hook-test" => match selftest::hook_probe(true) {
+            Ok(()) => 0,
+            Err(e) => {
+                println!("事件钩子不可用：{e}");
+                2
+            }
+        },
         "--clear-all" => selftest::clear_all(&args),
         "-h" | "--help" => {
             print_help();
@@ -52,8 +60,9 @@ fn print_help() {
 AudioFollow —— 让应用的声音跟随窗口所在的屏幕
 
 用法：
-  audiofollow                    常驻托盘 + 打开设置窗口
-  audiofollow --selftest         只读自检：显示器 / 音频设备 / 窗口归属 / 路由计划
+  audiofollow                    常驻托盘 + 打开设置窗口（窗口事件驱动）
+  audiofollow --selftest         只读自检：显示器 / 音频设备 / 窗口归属 / 进程树 / 路由计划
+  audiofollow --hook-test        单独验证窗口事件钩子能否收到事件
   audiofollow --write-test [pid] 写入往返验证（先备份，写入，读回，再还原）
   audiofollow --clear-all --yes  清空**所有**应用的持久化音频路由（会影响其他程序）
   audiofollow --help             显示本说明

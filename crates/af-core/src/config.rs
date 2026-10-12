@@ -8,12 +8,17 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{endpoint::AudioEndpoint, Role};
+use crate::win::monitor;
+use crate::win::Monitor;
 
 fn default_true() -> bool {
     true
 }
 fn default_poll_ms() -> u64 {
     1500
+}
+fn default_event_driven() -> bool {
+    true
 }
 fn default_version() -> u32 {
     1
@@ -25,7 +30,8 @@ pub struct ScreenRule {
     /// 显示器设备名，形如 `\\.\DISPLAY1`。这是稳定标识，显示器拔插后编号可能变，
     /// 但同一台机器上它是系统给的、比"第 2 块屏"可靠。
     pub monitor_device: String,
-    /// 只用于展示（显示器型号名）。
+    /// 只用于展示（显示器型号名）。**型号取不到时是空串**，展示时退回「显示器 N」，
+    /// 见 [`monitor::name_from_device`]。
     #[serde(default)]
     pub monitor_name: String,
     /// 音频端点原始 ID（不带 SWD 前缀）。
@@ -47,19 +53,54 @@ impl ScreenRule {
         }
     }
 
+    /// 显示器一侧的展示名（不看实时状态）。
+    ///
+    /// 优先用存下来的型号名；没有就用设备名推（`\\.\DISPLAY2` → `显示器 2`）。
+    pub fn monitor_display(&self) -> String {
+        if self.monitor_name.is_empty() {
+            monitor::name_from_device(&self.monitor_device)
+        } else {
+            self.monitor_name.clone()
+        }
+    }
+
+    /// 显示器一侧的展示名，**按当前实际扫到的显示器解析**。
+    ///
+    /// 比 [`Self::monitor_display`] 准：`显示器 N` 的 N 跟着枚举顺序走，
+    /// 所以配置里存的名字可能和界面上当前显示的对不上。只要有实时列表就该走这个。
+    pub fn monitor_display_in(&self, monitors: &[Monitor]) -> String {
+        monitors
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.device.eq_ignore_ascii_case(&self.monitor_device))
+            .map(|(i, m)| m.label(i))
+            .unwrap_or_else(|| self.monitor_display())
+    }
+
+    /// 音频设备一侧的展示名。
+    pub fn endpoint_display(&self) -> String {
+        if self.endpoint_name.is_empty() {
+            self.endpoint_id.clone()
+        } else {
+            self.endpoint_name.clone()
+        }
+    }
+
     pub fn describe(&self) -> String {
         format!(
             "{} → {}{}",
-            if self.monitor_name.is_empty() {
-                self.monitor_device.clone()
-            } else {
-                self.monitor_name.clone()
-            },
-            if self.endpoint_name.is_empty() {
-                &self.endpoint_id
-            } else {
-                &self.endpoint_name
-            },
+            self.monitor_display(),
+            self.endpoint_display(),
+            if self.enabled { "" } else { "（已停用）" }
+        )
+    }
+
+    /// 带实时显示器信息的版本。界面里用这个。
+    pub fn describe_in(&self, monitors: &[Monitor]) -> String {
+        format!(
+            "{} → {}{}",
+            self.monitor_display_in(monitors),
+            self.endpoint_display(),
             if self.enabled { "" } else { "（已停用）" }
         )
     }
@@ -72,9 +113,16 @@ pub struct AppConfig {
     /// 关掉之后只保留手动应用，不再自动跟随。
     #[serde(default = "default_true")]
     pub auto_follow: bool,
-    /// 轮询周期。窗口移动事件是后续增强项，当前靠轮询兜住。
+    /// **兜底**轮询周期（毫秒）。
+    ///
+    /// 事件驱动开着时（默认），真正的触发来自窗口事件钩子，这个周期只用来兜住
+    /// 事件覆盖不到的情况：进程重启、路由被别的程序改掉、音频会话刚出现。
+    /// 事件驱动关掉时它才恢复成主周期。
     #[serde(default = "default_poll_ms")]
     pub poll_ms: u64,
+    /// 是否用窗口事件钩子做实时触发。关掉则退回纯轮询（行为与旧版一致）。
+    #[serde(default = "default_event_driven")]
+    pub event_driven: bool,
     /// 接管哪些音频角色。默认只接管控制音与媒体，不碰通话音。
     #[serde(default = "Role::default_set")]
     pub roles: Vec<Role>,
@@ -88,6 +136,7 @@ impl Default for AppConfig {
             version: default_version(),
             auto_follow: true,
             poll_ms: default_poll_ms(),
+            event_driven: default_event_driven(),
             roles: Role::default_set(),
             rules: Vec::new(),
         }
@@ -197,9 +246,69 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str(text).unwrap();
         assert!(cfg.auto_follow);
         assert_eq!(cfg.poll_ms, 1500);
+        assert!(cfg.event_driven, "旧配置没有这个字段，应当默认开启事件驱动");
         assert_eq!(cfg.rules.len(), 1);
         assert!(cfg.rules[0].enabled);
         assert_eq!(cfg.rules[0].monitor_name, "");
+    }
+
+    #[test]
+    fn rule_display_falls_back_to_monitor_number() {
+        // 型号取不到（空串）——两块屏都这样时，必须靠设备名推出「显示器 N」来区分
+        let a = ScreenRule {
+            monitor_device: r"\\.\DISPLAY1".into(),
+            monitor_name: String::new(),
+            endpoint_id: "{x}".into(),
+            endpoint_name: "扬声器 A".into(),
+            enabled: true,
+        };
+        let b = ScreenRule {
+            monitor_device: r"\\.\DISPLAY2".into(),
+            monitor_name: String::new(),
+            endpoint_id: "{y}".into(),
+            endpoint_name: "扬声器 B".into(),
+            enabled: true,
+        };
+        assert_eq!(a.describe(), "显示器 1 → 扬声器 A");
+        assert_eq!(b.describe(), "显示器 2 → 扬声器 B");
+        assert_ne!(a.describe(), b.describe());
+    }
+
+    #[test]
+    fn rule_display_prefers_live_monitor_label() {
+        use crate::win::ffi::Rect;
+        let rule = ScreenRule {
+            monitor_device: r"\\.\DISPLAY2".into(),
+            monitor_name: String::new(),
+            endpoint_id: "{x}".into(),
+            endpoint_name: "扬声器".into(),
+            enabled: true,
+        };
+        // 实时列表里 DISPLAY2 排在第一位（比如它是主屏）
+        let live = vec![
+            Monitor {
+                handle: 0,
+                device: r"\\.\DISPLAY2".into(),
+                name: String::new(),
+                rect: Rect::new(0, 0, 1920, 1080),
+                work: Rect::new(0, 0, 1920, 1080),
+                is_primary: true,
+                dpi: 96,
+            },
+            Monitor {
+                handle: 0,
+                device: r"\\.\DISPLAY1".into(),
+                name: "MON-A".into(),
+                rect: Rect::new(1920, 0, 4480, 1440),
+                work: Rect::new(1920, 0, 4480, 1440),
+                is_primary: false,
+                dpi: 96,
+            },
+        ];
+        // 配置里存的是 DISPLAY2，实时排第一 → 应显示「显示器 1」，而不是靠字符串推的「显示器 2」
+        assert!(rule.describe_in(&live).starts_with("显示器 1 · 1920×1080 · 主屏 →"));
+        // 显示器不在线时退回字符串推导
+        assert!(rule.describe_in(&[]).starts_with("显示器 2 →"));
     }
 
     #[test]

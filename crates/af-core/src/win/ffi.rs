@@ -17,6 +17,8 @@ pub type DWORD = u32;
 pub type UINT = u32;
 pub type LONG = i32;
 pub type HRESULT = i32;
+pub type WPARAM = usize;
+pub type HWINEVENTHOOK = isize;
 
 // ------------------------------------------------------------------ 基础结构 --
 
@@ -127,6 +129,102 @@ pub struct SYSTEMTIME {
     pub milliseconds: u16,
 }
 
+/// 与 Win32 `FILETIME` 二进制兼容。单位为 100 ns，起点 1601-01-01。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+
+impl FILETIME {
+    /// 拼成便于比较的 64 位值。只比大小，不做日期换算。
+    pub fn as_u64(&self) -> u64 {
+        ((self.dwHighDateTime as u64) << 32) | self.dwLowDateTime as u64
+    }
+}
+
+pub const MAX_PATH: usize = 260;
+
+/// 与 Win32 `PROCESSENTRY32W` 二进制兼容。`szExeFile` 只有文件名，没有路径。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PROCESSENTRY32W {
+    pub dwSize: u32,
+    pub cntUsage: u32,
+    pub th32ProcessID: u32,
+    /// `ULONG_PTR`。x64 下是 8 字节，Rust 会自动补上前面的对齐填充。
+    pub th32DefaultHeapID: usize,
+    pub th32ModuleID: u32,
+    pub cntThreads: u32,
+    pub th32ParentProcessID: u32,
+    pub pcPriClassBase: i32,
+    pub dwFlags: u32,
+    pub szExeFile: [u16; MAX_PATH],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct POINT {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// 与 Win32 `MSG` 二进制兼容。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MSG {
+    pub hwnd: HWND,
+    pub message: UINT,
+    pub wParam: WPARAM,
+    pub lParam: LPARAM,
+    pub time: DWORD,
+    pub pt: POINT,
+    /// Vista 起多出来的字段，`GetMessageW` 会往里写，必须有。
+    pub lPrivate: DWORD,
+}
+
+/// `SetWinEventHook` 的回调原型。`CALLBACK` 即 `extern "system"`。
+pub type WINEVENTPROC = unsafe extern "system" fn(
+    HWINEVENTHOOK,
+    DWORD,
+    HWND,
+    LONG,
+    LONG,
+    DWORD,
+    DWORD,
+);
+
+// -------------------------------------------------------------------- 常量 ----
+
+/// `SetWinEventHook` 的事件范围。对象级事件从 0x8000 起。
+pub const EVENT_OBJECT_CREATE: u32 = 0x8000;
+pub const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+pub const EVENT_OBJECT_SHOW: u32 = 0x8002;
+pub const EVENT_OBJECT_HIDE: u32 = 0x8003;
+pub const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+pub const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
+pub const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+pub const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+pub const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+
+/// `idObject` 为 0 表示"事件主体就是窗口本身"。子对象（光标、菜单项、插入点……）
+/// 会以极高的频率报事件，必须在回调里筛掉。
+pub const OBJID_WINDOW: i32 = 0;
+
+/// 回调在安装钩子的线程上（通过它的消息循环）被调用，而不是被注入到目标进程里。
+pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+
+pub const WM_QUIT: u32 = 0x0012;
+
+pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+/// `CreateToolhelp32Snapshot` 失败时返回它。
+pub const INVALID_HANDLE_VALUE: isize = -1;
+
+pub const SWP_NOSIZE: UINT = 0x0001;
+pub const SWP_NOZORDER: UINT = 0x0004;
+pub const SWP_NOACTIVATE: UINT = 0x0010;
+
 // -------------------------------------------------------------------- 常量 ----
 
 pub const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
@@ -186,6 +284,44 @@ extern "system" {
     pub fn SetProcessDPIAware() -> BOOL;
     /// `value` 取 `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`（即 -4）。
     pub fn SetProcessDpiAwarenessContext(value: HANDLE) -> BOOL;
+
+    // ---- 窗口事件钩子 ----
+    /// 装一个事件钩子。返回 0 表示失败（`GetLastError` 有细节）。
+    ///
+    /// `WINEVENT_OUTOFCONTEXT` 模式下，回调**不是**被注入到目标进程，而是在
+    /// **安装钩子的这条线程**上、由它的消息循环派发。所以装钩子的线程必须泵消息。
+    pub fn SetWinEventHook(
+        eventMin: DWORD,
+        eventMax: DWORD,
+        hmodWinEventProc: HANDLE,
+        pfnWinEventProc: Option<WINEVENTPROC>,
+        idProcess: DWORD,
+        idThread: DWORD,
+        dwFlags: DWORD,
+    ) -> HWINEVENTHOOK;
+
+    pub fn UnhookWinEvent(hWinEventHook: HWINEVENTHOOK) -> BOOL;
+
+    /// 自造一个事件。只在自检里用来验证钩子确实通着。
+    pub fn NotifyWinEvent(event: DWORD, hwnd: HWND, idObject: LONG, idChild: LONG);
+
+    // ---- 消息循环 ----
+    pub fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT)
+        -> BOOL;
+    pub fn TranslateMessage(lpMsg: *const MSG) -> BOOL;
+    pub fn DispatchMessageW(lpMsg: *const MSG) -> isize;
+    pub fn PostThreadMessageW(idThread: DWORD, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> BOOL;
+
+    pub fn SetWindowPos(
+        hWnd: HWND,
+        hWndInsertAfter: HWND,
+        X: i32,
+        Y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: UINT,
+    ) -> BOOL;
+    pub fn GetDesktopWindow() -> HWND;
 }
 
 #[link(name = "dwmapi")]
@@ -217,6 +353,23 @@ extern "system" {
         lpdwSize: *mut DWORD,
     ) -> BOOL;
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+
+    // ---- 进程快照与进程信息 ----
+    pub fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
+    pub fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    /// 四个出参依次是：创建时间、退出时间、内核态时间、用户态时间。
+    /// 我们只用创建时间——`PROCESSENTRY32W` 里的父 pid 可能已被复用，靠时间戳才能识破。
+    pub fn GetProcessTimes(
+        hProcess: HANDLE,
+        lpCreationTime: *mut FILETIME,
+        lpExitTime: *mut FILETIME,
+        lpKernelTime: *mut FILETIME,
+        lpUserTime: *mut FILETIME,
+    ) -> BOOL;
+
+    pub fn GetCurrentThreadId() -> DWORD;
+    pub fn GetLastError() -> DWORD;
 }
 
 #[link(name = "ole32")]
