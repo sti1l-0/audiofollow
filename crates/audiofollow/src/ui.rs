@@ -16,7 +16,7 @@
 //!
 //! 关掉事件驱动（配置或界面）就退化成纯轮询，行为与早期版本一致。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::channel;
@@ -717,20 +717,30 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
     {
         let st = state.clone();
         let w = ui.as_weak();
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(PUMP_MS),
-            move || {
-                let Some(ui) = w.upgrade() else { return };
-                let mut s = st.borrow_mut();
-                while let Ok(ev) = rx.try_recv() {
-                    s.handle_tray(ev, &ui);
-                }
-                s.pump_events();
-                s.maybe_sync();
-                s.sync_to_ui(&ui);
-            },
-        );
+        // 窗口创建后 winit 不给 WS_THICKFRAME / WS_MAXIMIZEBOX，边框拖不动、
+        // 最大化是灰的。窗口实体化时机在 slint 内部，所以在事件循环里逐拍
+        // 尝试补样式位，成功一次即停。
+        let resizable_done = Rc::new(Cell::new(false));
+        {
+            let done = resizable_done.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(PUMP_MS),
+                move || {
+                    let Some(ui) = w.upgrade() else { return };
+                    let mut s = st.borrow_mut();
+                    if !done.get() && window::make_window_resizable("音频跟随") {
+                        done.set(true);
+                    }
+                    while let Ok(ev) = rx.try_recv() {
+                        s.handle_tray(ev, &ui);
+                    }
+                    s.pump_events();
+                    s.maybe_sync();
+                    s.sync_to_ui(&ui);
+                },
+            );
+        }
     }
 
     let result = ui.run();

@@ -1,8 +1,9 @@
 //! 顶层窗口枚举，以及把窗口落到具体一块显示器上。
 
 use super::ffi::{self, HWND, Rect, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-                 GWL_EXSTYLE, GW_OWNER, PROCESS_QUERY_LIMITED_INFORMATION,
-                 WS_EX_APPWINDOW, WS_EX_TOOLWINDOW};
+                 GWL_EXSTYLE, GWL_STYLE, GW_OWNER, PROCESS_QUERY_LIMITED_INFORMATION,
+                 SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                 WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_THICKFRAME};
 use super::monitor::{self, Monitor};
 
 /// 一个参与归属判定的顶层窗口。
@@ -50,6 +51,67 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: isize) -> i32 {
         out.push(w);
     }
     1 // 继续枚举
+}
+
+/// 给**本进程**指定标题的顶层窗口补上可缩放样式位。
+///
+/// 为什么需要：winit 建窗时给的样式是 `WS_CAPTION | WS_MINIMIZEBOX`，
+/// 没有 `WS_THICKFRAME`（拖边框缩放）和 `WS_MAXIMIZEBOX`（最大化按钮），
+/// 表现为窗口只能移动、拖不动边框、最大化按钮是灰的。
+/// 这里把两个样式位补齐，再用 `SWP_FRAMECHANGED` 让系统重算非客户区。
+///
+/// 返回是否找到并改成功。窗口还没创建时返回 `false`，调用方应当重试
+/// （slint 的 winit 后端把窗口实体化推迟到 show/run，创建时机外部不可见）。
+pub fn make_window_resizable(title: &str) -> bool {
+    #[repr(C)]
+    struct Ctx<'a> {
+        title: &'a str,
+        hwnd: HWND,
+    }
+
+    unsafe extern "system" fn find_proc(hwnd: HWND, lparam: isize) -> i32 {
+        let ctx = &mut *(lparam as *mut Ctx);
+        if ffi::IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut pid = 0u32;
+        ffi::GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != ffi::GetCurrentProcessId() {
+            return 1;
+        }
+        if window_title(hwnd) == ctx.title {
+            ctx.hwnd = hwnd;
+            return 0; // 找到了，停止枚举
+        }
+        1
+    }
+
+    let mut ctx = Ctx { title, hwnd: 0 };
+    unsafe {
+        ffi::EnumWindows(Some(find_proc), &mut ctx as *mut Ctx as isize);
+    }
+    if ctx.hwnd == 0 {
+        return false;
+    }
+
+    unsafe {
+        let style = ffi::GetWindowLongW(ctx.hwnd, GWL_STYLE) as i64;
+        let want = style | WS_THICKFRAME | WS_MAXIMIZEBOX;
+        if want != style {
+            // 样式值都在低 32 位，`SetWindowLongW` 足够
+            ffi::SetWindowLongW(ctx.hwnd, GWL_STYLE, want as i32);
+            ffi::SetWindowPos(
+                ctx.hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+    true
 }
 
 unsafe fn inspect(hwnd: HWND) -> Option<WindowInfo> {

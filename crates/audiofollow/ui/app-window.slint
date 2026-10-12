@@ -127,30 +127,30 @@ component Dropdown inherits Rectangle {
         clicked => { list-popup.show(); }
     }
 
-    HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 10px;
-        spacing: 6px;
-
-        Text {
-            // "▾" 在默认字体里没有字形（渲染成豆腐块），改用 Path 画三角
-            text: root.current-index >= 0 && root.current-index < root.model.length
-                ? root.model[root.current-index]
-                : root.placeholder;
-            font-size: 13px;
-            color: root.current-index >= 0 ? Theme.text : Theme.text-3;
-            overflow: elide;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        Path {
-            width: 9px;
-            height: 6px;
-            viewbox-width: 9;
-            viewbox-height: 6;
-            commands: "M 0 0 L 9 0 L 4.5 6 Z";
-            fill: Theme.text-3;
-        }
+    // 绝对定位而不是 HorizontalLayout：布局对固定尺寸的 Path 的垂直落点
+    // 不可控（实测箭头会飘到框顶，甚至整体不渲染），手工居中最稳。
+    Text {
+        // "▾" 在默认字体里没有字形（渲染成豆腐块），改用 Path 画三角
+        x: 12px;
+        width: parent.width - 12px - 26px;
+        height: parent.height;
+        text: root.current-index >= 0 && root.current-index < root.model.length
+            ? root.model[root.current-index]
+            : root.placeholder;
+        font-size: 13px;
+        color: root.current-index >= 0 ? Theme.text : Theme.text-3;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+    Path {
+        width: 9px;
+        height: 6px;
+        x: parent.width - 12px;
+        y: (parent.height - self.height) / 2;
+        viewbox-width: 9;
+        viewbox-height: 6;
+        commands: "M 0 0 L 9 0 L 4.5 6 Z";
+        fill: Theme.text-3;
     }
 
     list-popup := PopupWindow {
@@ -231,11 +231,16 @@ export component AppWindow inherits Window {
         spacing: 12px;
 
         // ================= 标题栏 =================
-        HorizontalLayout {
-            spacing: 12px;
+        // 不用 HorizontalLayout：同一行里"固定高度元素"(图标/开关)和 Text 的
+        // 垂直落点由布局 stretch 规则决定，实测两者会错位(开关偏上、文字贴底)。
+        // 全部绝对定位，落点完全可控。
+        Rectangle {
+            height: 38px;
 
             Rectangle {
                 // 音波图标:三根白色圆角竖条
+                x: 0;
+                y: 0;
                 width: 38px;
                 height: 38px;
                 border-radius: 11px;
@@ -246,8 +251,11 @@ export component AppWindow inherits Window {
             }
 
             VerticalLayout {
+                x: 50px;
+                y: 0;
+                height: parent.height;
+                width: parent.width - 50px - 150px;
                 spacing: 2px;
-                horizontal-stretch: 1;
                 Text {
                     text: "音频跟随";
                     font-size: 19px;
@@ -262,18 +270,18 @@ export component AppWindow inherits Window {
                 }
             }
 
-            HorizontalLayout {
-                spacing: 8px;
-                Text {
-                    text: "自动跟随";
-                    font-size: 13px;
-                    color: Theme.text-2;
-                    vertical-alignment: center;
-                }
-                Switch {
-                    checked <=> root.auto-follow;
-                    toggled(on) => { root.toggle-auto-follow(on); }
-                }
+            Text {
+                text: "自动跟随";
+                font-size: 13px;
+                color: Theme.text-2;
+                x: parent.width - 36px - 8px - self.width;
+                y: (parent.height - self.height) / 2;
+            }
+            Switch {
+                checked <=> root.auto-follow;
+                toggled(on) => { root.toggle-auto-follow(on); }
+                x: parent.width - self.width;
+                y: (parent.height - self.height) / 2;
             }
         }
 
@@ -514,17 +522,22 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
 
-            HorizontalLayout {
-                spacing: 8px;
+            // 左侧组合用固定宽度容器 + 绝对定位：避免和标题栏同样的对齐错位
+            Rectangle {
+                width: 268px;
+
                 Text {
                     text: "实时事件驱动";
                     font-size: 13px;
                     color: Theme.text-2;
-                    vertical-alignment: center;
+                    x: 0;
+                    y: (parent.height - self.height) / 2;
                 }
                 Switch {
                     checked <=> root.event-driven;
                     toggled(on) => { root.toggle-event-driven(on); }
+                    x: 84px;
+                    y: (parent.height - self.height) / 2;
                 }
                 Text {
                     text: root.event-driven
@@ -532,7 +545,10 @@ export component AppWindow inherits Window {
                         : "已关闭 · 纯轮询";
                     font-size: 11px;
                     color: Theme.text-3;
-                    vertical-alignment: center;
+                    x: 128px;
+                    width: parent.width - 128px;
+                    overflow: elide;
+                    y: (parent.height - self.height) / 2;
                 }
             }
 
