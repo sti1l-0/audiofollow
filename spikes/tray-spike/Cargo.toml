@@ -1,0 +1,14 @@
+[package]
+name = "audiofollow-tray-spike"
+version = "0.1.0"
+edition = "2021"
+description = "Tray-icon feasibility + footprint measurement for the AudioFollow tray app"
+
+[dependencies]
+tray-icon = "0.26"
+tao = "0.37"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

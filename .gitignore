@@ -1,0 +1,18 @@
+# ---- Rust 构建产物 ----
+# 注意：Cargo.lock 需要提交（这是二进制应用，不是库）
+target/
+
+# ---- 第三方源码，仅供研究，不随仓库分发 ----
+# SoundSwitch(GPL-3.0) / EarTrumpet(MIT) 的解压目录与下载包
+research/
+
+# ---- 本地 agent 工作数据 ----
+.workbuddy/
+
+# ---- 编辑器 / 操作系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+*~
