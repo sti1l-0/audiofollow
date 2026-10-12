@@ -391,7 +391,7 @@ impl AppState {
         // 让下一轮如实报告它们的新动作。
         self.last_action.clear();
         match saved {
-            Ok(()) => format!("已删除绑定：{desc}（该屏上的应用会被还原）"),
+            Ok(()) => format!("已删除绑定：{desc}"),
             Err(e) => format!("已删除绑定：{desc}，但保存失败：{e}"),
         }
     }
