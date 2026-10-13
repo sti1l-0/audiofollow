@@ -589,8 +589,8 @@ mod tests {
         let mut e = vec![0u8; 128];
         let off = EDID_DESCRIPTOR_OFFSETS[3];
         e[off + 3] = EDID_TAG_MONITOR_NAME;
-        e[off + 5..off + 8].copy_from_slice(b"MON-B");
-        e[off + 8] = 0x0A;
+        e[off + 5..off + 10].copy_from_slice(b"MON-B");
+        e[off + 10] = 0x0A;
         assert_eq!(monitor_name_from_edid(&e).as_deref(), Some("MON-B"));
     }
 
@@ -619,17 +619,17 @@ mod tests {
 
     #[test]
     fn edid_manufacturer_is_decoded() {
-        // "ACM" → S=19, K=11, G=7 → (19<<10)|(11<<5)|7 = 0x4D67
+        // "ACM" → A=1, C=3, M=13 → (1<<10)|(3<<5)|13 = 1024+96+13 = 1133 = 0x046D
         let mut e = vec![0u8; 16];
-        e[8] = 0x4D;
-        e[9] = 0x67;
+        e[8] = 0x04;
+        e[9] = 0x6D;
         assert_eq!(edid_manufacturer(&e).as_deref(), Some("ACM"));
 
-        // "DEL" → D=4, E=5, L=12 → (4<<10)|(5<<5)|12 = 4096+160+12 = 4268 = 0x10AC
+        // "ACO" → A=1, C=3, O=15 → (1<<10)|(3<<5)|15 = 1024+96+15 = 1135 = 0x046F
         let mut d = vec![0u8; 16];
-        d[8] = 0x10;
-        d[9] = 0xAC;
-        assert_eq!(edid_manufacturer(&d).as_deref(), Some("DEL"));
+        d[8] = 0x04;
+        d[9] = 0x6F;
+        assert_eq!(edid_manufacturer(&d).as_deref(), Some("ACO"));
 
         // 全零不是合法厂商码
         assert_eq!(edid_manufacturer(&vec![0u8; 16]), None);

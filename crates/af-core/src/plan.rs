@@ -24,8 +24,8 @@
 //! ```text
 //! msedge.exe          pid=1836   后代=19   同名=19   异名=0      ← 全部同名，规则完美覆盖
 //! msedgewebview2.exe  pid=11048  后代=5    同名=5    异名=0
-//! imapp.exe          pid=3544   后代=15   同名=4    异名=crashpad_handler,imapp_helper×10
-//! launcher.exe       pid=8128   后代=29   同名=8    异名=cmd,conhost×9,node×3,pwsh,…
+//! imapp.exe           pid=3544   后代=15   同名=4    异名=crashpad_handler,imapp_helper×10
+//! launcher.exe        pid=8128   后代=29   同名=8    异名=cmd,conhost×9,node×3,pwsh,…
 //! ```
 //!
 //! 最后一行是关键反例：launcher 的子树里挂着一堆**毫不相干**的 cmd / node / pwsh
