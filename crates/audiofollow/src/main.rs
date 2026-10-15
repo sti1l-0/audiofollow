@@ -6,12 +6,24 @@
 //! - `--hook-test`：单独验证窗口事件钩子通不通（必要时会挪动一个窗口 2px 再复原）
 //! - `--write-test [pid]`：在单个进程上做可回滚的写入往返验证
 
+// 这是个托盘常驻的 GUI 程序：双击时不该弹出一个控制台黑框，所以编译成 WINDOWS 子系统。
+// 代价是进程默认没有控制台，命令行子命令必须自己把父进程的控制台接回来（见 `main`
+// 开头），否则所有 `println!` 会被静默丢弃——不报错，只是什么都没有。
+#![windows_subsystem = "windows"]
+
 mod icon;
 mod selftest;
 mod tray;
 mod ui;
 
 fn main() {
+    // 编译成 GUI 子系统后本进程不带控制台，先把父进程的控制台接回来：
+    // 从终端启动时，这一步让下面所有 println! 的输出能被看见；双击启动时父进程是
+    // explorer、它没有控制台，调用失败但没有副作用——也就不会冒出黑框。
+    // 必须在任何 println! 之前调用，Rust 的 stdout 句柄只取一次。
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe { af_core::win::ffi::AttachConsole(ATTACH_PARENT_PROCESS) };
+
     // 控制台切 UTF-8，免得中文日志在 GBK 代码页的窗口里变乱码
     unsafe { af_core::win::ffi::SetConsoleOutputCP(65001) };
 

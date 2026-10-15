@@ -371,6 +371,9 @@ extern "system" {
     pub fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
     /// 把控制台输出代码页切到 UTF-8，否则中文日志在默认 936 代码页的窗口里是乱码。
     pub fn SetConsoleOutputCP(wCodePageID: UINT) -> BOOL;
+    /// 把当前进程附到父进程的控制台。GUI 子系统的进程默认不带控制台，
+    /// 命令行模式下靠它把输出接回来。
+    pub fn AttachConsole(dwProcessId: DWORD) -> BOOL;
 
     pub fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD)
         -> HANDLE;
