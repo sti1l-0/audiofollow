@@ -77,6 +77,9 @@ struct AppState {
     reconciler: Reconciler,
     log: Vec<LogRow>,
     last_sync: Instant,
+    /// 已经收到退出指令：还原做完了，正在等托盘线程收工。
+    /// 这之后**不允许**再动任何路由 —— 否则刚还回去的记录会被重新写一遍。
+    quitting: bool,
     /// 不直接用，靠 Drop 保证托盘句柄活着。
     _tray: tray::TrayHandle,
 
@@ -116,6 +119,7 @@ impl AppState {
             reconciler: Reconciler::new(),
             log: Vec::new(),
             last_sync: Instant::now() - Duration::from_secs(3600),
+            quitting: false,
             _tray: tray_handle,
             hook: None,
             dirty: None,
@@ -478,18 +482,26 @@ impl AppState {
     }
 
     fn shutdown(&mut self) {
+        // 从这里起进入退出流程：定时器那边不再同步任何路由，
+        // 否则刚还回去的记录会被下一轮 maybe_sync 重新写一遍。
+        self.quitting = true;
         println!("---- 退出，开始还原 ----");
         let msg = self.restore_all();
         println!("{msg}");
     }
 
     /// 处理来自托盘线程的事件。
+    ///
+    /// 这里在**主线程**上跑（由下面的定时器把 channel 里的事件取出来），
+    /// 所以可以放心碰界面状态和 COM。
     fn handle_tray(&mut self, ev: TrayEvent, ui: &AppWindow) {
         match ev {
             TrayEvent::OpenSettings => {
                 let _ = ui.show();
             }
-            TrayEvent::ToggleAutoFollow(on) => {
+            TrayEvent::ToggleAutoFollow => {
+                // 以主线程的配置为唯一真相源取反；托盘上那个勾选框只是显示。
+                let on = !self.config.auto_follow;
                 let msg = self.set_auto_follow(on);
                 self.log(msg);
             }
@@ -499,7 +511,10 @@ impl AppState {
             }
             TrayEvent::Quit => {
                 self.shutdown();
-                let _ = slint::quit_event_loop();
+                // 还原已经落地，让托盘线程收工 —— 它退出事件循环时 tao 会直接
+                // 以 0 结束进程。不走 slint 的退出信号：那条路是异步的，而此刻
+                // 我们还在定时器回调里，只要它没被处理就退不掉。
+                self._tray.request_quit();
             }
         }
     }
@@ -746,6 +761,11 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
                 let mut s = st.borrow_mut();
                 while let Ok(ev) = rx.try_recv() {
                     s.handle_tray(ev, &ui);
+                }
+                if s.quitting {
+                    // 收到退出指令了：还原已经做完，剩下的交给托盘线程收工。
+                    // 这时候再去 pump/maybe_sync 会把刚还回去的路由又改一遍。
+                    return;
                 }
                 s.pump_events();
                 s.maybe_sync();
