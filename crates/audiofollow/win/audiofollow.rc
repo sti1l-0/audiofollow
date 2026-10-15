@@ -1,0 +1,45 @@
+// exe 的 Windows 资源：文件图标 + 版本信息。
+//
+// 为什么需要这个文件：slint 的 `Window.icon` 只管**运行时**的窗口/任务栏图标，
+// 编不进 PE 头的资源节。所以资源管理器、任务栏固定项、Alt+Tab 里显示的
+// exe 文件图标会是空白的 —— 那是一张编译期就定死的图。
+//
+// 版本号由 build.rs 从 Cargo.toml 生成到 version_gen.h，这里 include 进来，
+// 免得两处各写一遍对不上。
+//
+// 本文件保持纯 ASCII：rc.exe 会按当前代码页读它，中文在非 UTF-8 代码页下会乱码，
+// 而 Cargo 的代码页取决于用户区域设置，不能依赖。
+
+#include "version_gen.h"
+
+// 编号用数字（不 include windows.h），rc 会把 icon.ico 拆成 RT_ICON 组。
+// 10 个尺寸各一条，Windows 按显示场景挑。
+101 ICON "ui/icon.ico"
+
+1 VERSIONINFO
+FILEVERSION AF_VERSION_COMMA
+PRODUCTVERSION AF_VERSION_COMMA
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "AudioFollow"
+            VALUE "FileVersion", AF_VERSION_STR
+            VALUE "InternalName", "audiofollow"
+            VALUE "OriginalFilename", "audiofollow.exe"
+            VALUE "ProductName", "AudioFollow"
+            VALUE "ProductVersion", AF_VERSION_STR
+            VALUE "LegalCopyright", "MIT OR Apache-2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
