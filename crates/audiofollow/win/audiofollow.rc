@@ -7,8 +7,13 @@
 // 版本号由 build.rs 从 Cargo.toml 生成到 version_gen.h，这里 include 进来，
 // 免得两处各写一遍对不上。
 //
-// 本文件保持纯 ASCII：rc.exe 会按当前代码页读它，中文在非 UTF-8 代码页下会乱码，
-// 而 Cargo 的代码页取决于用户区域设置，不能依赖。
+// 本文件是 UTF-8，所以**第一行必须是 code_page 声明**：
+// rc.exe 默认按当前代码页读脚本（中文系统上是 936/GBK），
+// 把 UTF-8 的中文注释当 GBK 解会解坏，而且坏得很难看 ——
+// 实测表现为 `error RC2104: undefined keyword or key name: AF_VERSION_COMMA`，
+// 像是宏没定义，其实是被注释吃掉了 include。
+// 这一条是踩出来的：v0.1.0 的 exe 图标就是这么丢的（只告警不中断，没人看见）。
+#pragma code_page(65001)
 
 #include "version_gen.h"
 

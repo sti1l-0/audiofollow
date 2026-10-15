@@ -18,6 +18,10 @@ fn main() {
 ///
 /// 找不到 rc.exe 时只告警、不中断构建：图标属于锦上添花，
 /// 不该让一个缺了 Windows SDK 的机器连程序都编不出来。
+///
+/// 代价是失败不会挡住构建，所以**发布前必须验一遍** ——
+/// 用 `.workbuddy/verify_pe.py` 直接读 PE 资源节确认图标与版本信息在不在。
+/// 光看构建成功是靠不住的（v0.1.0 就是这么把图标丢掉的）。
 #[cfg(windows)]
 fn embed_windows_resources() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -61,14 +65,34 @@ fn embed_windows_resources() {
         .arg(&res)
         .arg(&rc_file)
         .current_dir(&manifest)
-        .status();
+        .output();
 
     match status {
-        Ok(s) if s.success() => {
+        Ok(out) if out.status.success() => {
             // link.exe 认识 .res，直接作为输入文件即可。
             println!("cargo:rustc-link-arg={}", res.display());
         }
-        Ok(s) => println!("cargo:warning=rc.exe 退出码 {s}，未嵌入 exe 图标"),
+        Ok(out) => {
+            // 必须把 rc.exe 的原话带出来。它默认直接把错误写到继承来的 stdout，
+            // 那条路会被 cargo 当成构建脚本的输出吞掉（中文路径还会因为编码不一致
+            // 整段丢字），结果只看到一句"rc.exe 退出码 1"，等于没说。
+            // v0.1.0 的图标就是这么丢的：告警里看不出原因，于是没人发现 exe 里其实没资源。
+            for stream in [&out.stdout, &out.stderr] {
+                let text = String::from_utf8_lossy(stream);
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    println!("cargo:warning=rc.exe: {line}");
+                }
+            }
+            println!(
+                "cargo:warning=rc.exe 退出码 {}，未嵌入 exe 图标与版本信息。\
+                 exe 在资源管理器里会显示空白图标。命令：{} /nologo /I {} /fo {} {}",
+                out.status,
+                rc_exe.display(),
+                out_dir.display(),
+                res.display(),
+                rc_file.display()
+            );
+        }
         Err(e) => println!("cargo:warning=调用 rc.exe 失败：{e}，未嵌入 exe 图标"),
     }
 }
