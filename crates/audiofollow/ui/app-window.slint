@@ -222,6 +222,7 @@ export component AppWindow inherits Window {
     in-out property <bool> auto-follow: true;
     in-out property <bool> event-driven: true;
     in-out property <bool> hook-live: false;
+    in-out property <bool> startup: false;
     in-out property <string> headline: "正在初始化…";
 
     // ---- Rust 侧挂接的动作 ----
@@ -231,6 +232,7 @@ export component AppWindow inherits Window {
     callback apply-now();
     callback toggle-auto-follow(bool);
     callback toggle-event-driven(bool);
+    callback toggle-startup(bool);
     callback restore-all();
 
     VerticalLayout {
@@ -258,7 +260,8 @@ export component AppWindow inherits Window {
                 x: 50px;
                 y: 0;
                 height: parent.height;
-                width: parent.width - 50px - 150px;
+                // 右侧留出两组开关的位置（「开机启动」+「自动跟随」）
+                width: parent.width - 50px - 240px;
                 spacing: 2px;
                 Text {
                     text: "音频跟随";
@@ -274,7 +277,10 @@ export component AppWindow inherits Window {
                 }
             }
 
-            Text {
+            // 两个全局开关：右起「自动跟随」，「开机启动」在它左边。
+            // 位置靠**引用另一个元素的 x** 推出来，不用布局 —— slint 里固定尺寸
+            // 元素（Switch）在布局中的垂直落点不可控（实测差 15px），绝对定位最稳。
+            auto-label := Text {
                 text: "自动跟随";
                 font-size: 13px;
                 color: Theme.text-2;
@@ -285,6 +291,20 @@ export component AppWindow inherits Window {
                 checked <=> root.auto-follow;
                 toggled(on) => { root.toggle-auto-follow(on); }
                 x: parent.width - self.width;
+                y: (parent.height - self.height) / 2;
+            }
+
+            startup-label := Text {
+                text: "开机启动";
+                font-size: 13px;
+                color: Theme.text-2;
+                x: auto-label.x - 24px - self.width;
+                y: (parent.height - self.height) / 2;
+            }
+            Switch {
+                checked <=> root.startup;
+                toggled(on) => { root.toggle-startup(on); }
+                x: startup-label.x + startup-label.width + 8px;
                 y: (parent.height - self.height) / 2;
             }
         }

@@ -5,8 +5,10 @@
 pub mod dpi;
 pub mod ffi;
 pub mod hook;
+pub mod instance;
 pub mod monitor;
 pub mod proc;
+pub mod startup;
 pub mod window;
 
 pub use ffi::Rect;

@@ -71,6 +71,8 @@ crates/af-core/        纯逻辑库（无 GUI 依赖）
   src/win/window.rs     顶层窗口枚举 + 归属判定
   src/win/proc.rs       进程树快照 + 父 PID 复用校验
   src/win/hook.rs       SetWinEventHook 窗口事件钩子
+  src/win/startup.rs    开机自动启动（HKCU 的 Run 项 + 路径自愈）
+  src/win/instance.rs   单实例保护（命名互斥量）+ 无窗口时的提示框
   src/audio/            Core Audio COM 互操作 + 未公开的 AudioPolicyConfig
   src/config.rs         配置持久化（%APPDATA%\AudioFollow\config.json）
   src/plan.rs           窗口→屏幕→设备的映射计划（多窗口仲裁 + 多进程展开）
@@ -104,6 +106,9 @@ cargo run -p audiofollow -- --write-test [pid]
 
 # 正常启动：托盘 + 设置窗口
 cargo run -p audiofollow
+
+# 只驻留托盘，不打开设置窗口（开机自动启动用的就是这个）
+cargo run -p audiofollow -- --startup
 ```
 
 需要 Rust 1.75+ 与 MSVC 工具链。若依赖拉取超时，套一层本地代理：
@@ -111,6 +116,36 @@ cargo run -p audiofollow
 ```bash
 env https_proxy=http://127.0.0.1:10612 http_proxy=http://127.0.0.1:10612 cargo build
 ```
+
+---
+
+## 托盘、关闭与退出
+
+这是个**托盘常驻**的程序，所以：
+
+| 操作 | 行为 |
+|---|---|
+| 点窗口右上角的关闭 | **只是把窗口藏进托盘**，程序继续在后台跟随。再从托盘菜单「打开设置…」可以叫回来 |
+| 托盘菜单「退出并还原」 | 真正退出。**它会先把改过的音频路由还回原样**，再结束进程 |
+| 带 `--startup` 启动 | 同上，但不打开设置窗口（开机自动启动用） |
+| 重复启动第二个实例 | 第二个实例会提示「已在运行」然后自己退出（`--startup` 那条路静默退出，不弹框） |
+
+> **退出请走托盘菜单。** 直接结束进程（任务管理器、`taskkill`）会跳过还原这一步，
+> 之前改过的按应用音频路由就留在系统里了 —— 它们会出现在系统音量合成器里，
+> 需要手工改回「默认」。
+
+### 开机自动启动
+
+界面标题栏右侧有「开机启动」开关。打开后写入：
+
+```
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+    AudioFollow = "C:\path\to\audiofollow.exe" --startup
+```
+
+选这个位置的理由：**不需要管理员权限**（写 `HKLM` 才要提权，一个托盘小工具为开机启动弹 UAC 不划算），用户还能在「任务管理器 → 启动应用」里自己看见并禁用——这是系统给用户的正规入口。
+
+注册表里存的是 exe 的**绝对路径**，所以程序换目录之后记录会失效。每次启动都会拿当前路径和记录比对一次，不一致就用当前路径改写。scoop 安装尤其依赖这个自愈：`current` 只是符号链接，而程序自己看到的是解析后的版本化目录（`apps\audiofollow\0.1.1\audiofollow.exe`），每次 `scoop update` 都会变。
 
 ---
 

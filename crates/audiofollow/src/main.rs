@@ -1,7 +1,8 @@
 //! AudioFollow —— 让应用的声音跟随窗口所在的屏幕。
 //!
 //! 运行方式：
-//! - 无参数：常驻托盘 + 设置窗口（窗口事件驱动，毫秒级响应）
+//! - 无参数：常驻托盘 + 打开设置窗口（窗口事件驱动，毫秒级响应）
+//! - `--startup`：同上，但**不**打开设置窗口（开机自动启动用这个）
 //! - `--selftest`：只读自检，把整条链路打印出来
 //! - `--hook-test`：单独验证窗口事件钩子通不通（必要时会挪动一个窗口 2px 再复原）
 //! - `--write-test [pid]`：在单个进程上做可回滚的写入往返验证
@@ -50,13 +51,9 @@ fn main() {
             print_help();
             0
         }
-        "" => match ui::run(dpi) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("界面启动失败：{e}");
-                2
-            }
-        },
+        "" => run_gui(dpi, true),
+        // 开机自动启动走这条：同样常驻托盘，但不弹设置窗口。
+        "--startup" => run_gui(dpi, false),
         other => {
             eprintln!("未知参数：{other}");
             print_help();
@@ -67,6 +64,47 @@ fn main() {
     std::process::exit(code);
 }
 
+/// 图形界面模式的入口：单实例保护 + 起界面。
+///
+/// 单实例是「关闭只隐藏到托盘」的必要配套 —— 用户很容易以为窗口没了就是退出了，
+/// 于是再双击一次；而**两份实例同时跑会互相打架**：各自维护自己的"原值备份"，
+/// 退出时按自己看到的原值还原，谁都还不到最初的值。详见 `af_core::win::instance`。
+fn run_gui(dpi: af_core::win::dpi::DpiAwareness, show_window: bool) -> i32 {
+    use af_core::win::instance::{self, Acquire, SingleInstance};
+
+    // 绑到具名变量上活到函数结束：Drop 时释放互斥量。
+    let _instance = match SingleInstance::acquire() {
+        Acquire::First(i) => Some(i),
+        Acquire::AlreadyRunning => {
+            // 开机自动启动这条路**不能弹框**：登录时冒一个对话框，比什么都不做更糟。
+            // 用户不容易遇到"开机启动 + 手动启动"同时发生（秒级窗口），
+            // 真遇到了就静默退出，反正已经有一份在跑。
+            if show_window {
+                instance::message_box(
+                    "音频跟随",
+                    "AudioFollow 已经在运行。\n\n\
+                     它常驻在任务栏右下角的托盘区（Win11 里可能被收进「^」展开区）：\n\
+                     右键托盘图标可以打开设置窗口，或选「退出并还原」。",
+                );
+            }
+            return 0;
+        }
+        Acquire::Unavailable(code) => {
+            // 保护没起来，但不该因此拦着用户用程序 —— 如实说一声就继续。
+            eprintln!("单实例保护不可用（错误码 {code}），本次不做重复启动检查");
+            None
+        }
+    };
+
+    match ui::run(dpi, show_window) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("界面启动失败：{e}");
+            2
+        }
+    }
+}
+
 fn print_help() {
     println!(
         "\
@@ -74,13 +112,18 @@ AudioFollow —— 让应用的声音跟随窗口所在的屏幕
 
 用法：
   audiofollow                    常驻托盘 + 打开设置窗口（窗口事件驱动）
+  audiofollow --startup          常驻托盘，但不打开设置窗口（开机自动启动用）
   audiofollow --selftest         只读自检：显示器 / 音频设备 / 窗口归属 / 进程树 / 路由计划
   audiofollow --hook-test        单独验证窗口事件钩子能否收到事件
   audiofollow --write-test [pid] 写入往返验证（先备份，写入，读回，再还原）
   audiofollow --clear-all --yes  清空**所有**应用的持久化音频路由（会影响其他程序）
   audiofollow --help             显示本说明
 
+关掉设置窗口不会退出程序，只是把它藏进托盘；退出请走托盘菜单的「退出并还原」，
+否则改过的音频路由会留在系统里。
+
 配置文件：%APPDATA%\\AudioFollow\\config.json
+开机自动启动：HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 下的 AudioFollow
 "
     );
 }

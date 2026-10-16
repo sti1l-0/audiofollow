@@ -259,14 +259,30 @@ pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 /// 中间两段正好是注册表实例键（见 `monitor::edid_from_interface_path`）。
 pub const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
 
-// ---- 注册表（读显示器 EDID 用） ----
+// ---- 注册表（读显示器 EDID / 写开机启动项） ----
 
 /// `HKEY_LOCAL_MACHINE`。`0x80000002` 按 32 位有符号解释再符号扩展。
 pub const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002u32 as i32 as HKEY;
+/// `HKEY_CURRENT_USER`。开机启动项写这里——**不需要管理员权限**，写 HKLM 才需要提权。
+pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001u32 as i32 as HKEY;
 /// `KEY_READ` = `STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY`。
 pub const KEY_READ: u32 = 0x0002_0019;
+pub const KEY_SET_VALUE: u32 = 0x0002;
 pub const ERROR_SUCCESS: i32 = 0;
+pub const ERROR_FILE_NOT_FOUND: i32 = 2;
 pub const REG_BINARY: u32 = 3;
+pub const REG_SZ: u32 = 1;
+
+/// `CreateMutexW` 在"同名对象已存在"时仍然成功，靠这个错误码区分。
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+
+// ---- 消息框 ----
+
+pub const MB_OK: u32 = 0x0000_0000;
+pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+/// 置前（否则进度提示可能被压在别的窗口后面）。
+pub const MB_SETFOREGROUND: u32 = 0x0001_0000;
+pub const MB_TOPMOST: u32 = 0x0004_0000;
 /// EDID 基础块 128 字节，最多 3 个扩展块；给点余量防止被超长值撑爆。
 pub const EDID_MAX_LEN: u32 = 4 * 1024;
 
@@ -312,6 +328,9 @@ extern "system" {
     pub fn SetProcessDPIAware() -> BOOL;
     /// `value` 取 `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`（即 -4）。
     pub fn SetProcessDpiAwarenessContext(value: HANDLE) -> BOOL;
+
+    /// 系统消息框。用于"没有窗口可用"时的提示（第二实例启动时）。
+    pub fn MessageBoxW(hwnd: HWND, lpText: *const u16, lpCaption: *const u16, uType: UINT) -> i32;
 
     // ---- 窗口事件钩子 ----
     /// 装一个事件钩子。返回 0 表示失败（`GetLastError` 有细节）。
@@ -401,6 +420,17 @@ extern "system" {
 
     pub fn GetCurrentThreadId() -> DWORD;
     pub fn GetLastError() -> DWORD;
+
+    /// 命名互斥量，用来做单实例判定。
+    ///
+    /// 名字带 `Local\` 前缀 → 作用域限定在**当前登录会话**，多用户同时登录时各跑各的
+    /// （这正是我们要的：两个用户各自的托盘图标互不干扰）。
+    /// 已存在同名对象时返回有效句柄，但 `GetLastError()` 是 `ERROR_ALREADY_EXISTS`。
+    pub fn CreateMutexW(
+        lpMutexAttributes: *mut c_void,
+        bInitialOwner: BOOL,
+        lpName: *const u16,
+    ) -> HANDLE;
 }
 
 #[link(name = "advapi32")]
@@ -425,6 +455,21 @@ extern "system" {
     ) -> i32;
 
     pub fn RegCloseKey(hKey: HKEY) -> i32;
+
+    /// 写一个值。开机启动项用它写入 exe 路径（`REG_SZ`，**按字节数**给长度，
+    /// 且要包含结尾的 NUL —— 少了 NUL，系统读出来会把内存里的脏数据一起当路径）。
+    pub fn RegSetValueExW(
+        hKey: HKEY,
+        lpValueName: *const u16,
+        Reserved: u32,
+        dwType: u32,
+        lpData: *const u8,
+        cbData: u32,
+    ) -> i32;
+
+    /// 删一个值。关掉开机启动时用；值本来就不存在会返回 `ERROR_FILE_NOT_FOUND`，
+    /// 那不算失败（已经是目标状态）。
+    pub fn RegDeleteValueW(hKey: HKEY, lpValueName: *const u16) -> i32;
 }
 
 #[link(name = "ole32")]

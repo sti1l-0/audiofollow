@@ -29,6 +29,7 @@ use af_core::config::{AppConfig, ScreenRule};
 use af_core::plan;
 use af_core::reconcile::{Action, Change, Reconciler};
 use af_core::win::hook::WindowEventHook;
+use af_core::win::startup::{self, StartupState};
 use af_core::win::{self, dpi::DpiAwareness, window, Monitor, ProcTree};
 
 use crate::tray::{self, TrayEvent};
@@ -80,6 +81,11 @@ struct AppState {
     /// 已经收到退出指令：还原做完了，正在等托盘线程收工。
     /// 这之后**不允许**再动任何路由 —— 否则刚还回去的记录会被重新写一遍。
     quitting: bool,
+    /// 开机自动启动当前是开是关。
+    ///
+    /// **真相源在注册表里**（用户可以绕过我们从任务管理器里禁用它），
+    /// 这个字段只是启动时读一次的缓存，给界面用。
+    startup: bool,
     /// 不直接用，靠 Drop 保证托盘句柄活着。
     _tray: tray::TrayHandle,
 
@@ -120,6 +126,7 @@ impl AppState {
             log: Vec::new(),
             last_sync: Instant::now() - Duration::from_secs(3600),
             quitting: false,
+            startup: false,
             _tray: tray_handle,
             hook: None,
             dirty: None,
@@ -136,9 +143,32 @@ impl AppState {
             me.log(w);
         }
         me.log(format!("配置文件：{}", AppConfig::path().display()));
+        me.init_startup();
         me.rescan();
         me.install_hook();
         me
+    }
+
+    /// 读一次开机启动状态，顺手把失效的路径修好。
+    ///
+    /// 注册表里存的是绝对路径，程序换目录（尤其是 scoop 升级到新的版本化目录）之后
+    /// 这条记录会静默失效。每次启动都对齐一次，这个问题就不会攒到用户发现。
+    fn init_startup(&mut self) {
+        match startup::sync_to_current_exe() {
+            Ok(StartupState::Disabled) => {}
+            Ok(StartupState::Enabled) => {
+                self.startup = true;
+                self.log("开机自动启动：已开启");
+            }
+            Ok(StartupState::Stale(old)) => {
+                self.startup = true;
+                self.log(format!(
+                    "开机自动启动：已开启。记录里的程序路径已失效（{old}），\
+                     已按当前路径更新"
+                ));
+            }
+            Err(e) => self.log(format!("读取开机启动状态失败：{e}")),
+        }
     }
 
     fn log(&mut self, msg: impl Into<String>) {
@@ -412,6 +442,30 @@ impl AppState {
         }
     }
 
+    /// 开关开机自动启动。
+    ///
+    /// 不做"乐观更新"：`self.startup` 只在注册表真的写成功之后才改。
+    /// 写失败时界面会被 [`Self::sync_to_ui`] 拨回原状 —— 开关的可信度比手感重要。
+    fn set_startup(&mut self, on: bool) -> String {
+        if self.startup == on {
+            return format!("开机自动启动已经是{}状态", if on { "开启" } else { "关闭" });
+        }
+        match startup::set_enabled(on) {
+            Ok(()) => {
+                self.startup = on;
+                if on {
+                    let line = std::env::current_exe()
+                        .map(|p| startup::command_line(&p))
+                        .unwrap_or_else(|_| "（取当前程序路径失败）".into());
+                    format!("已设为开机自动启动：{line}（登录后只驻留托盘，不弹设置窗口）")
+                } else {
+                    "已取消开机自动启动".into()
+                }
+            }
+            Err(e) => format!("设置开机自动启动失败：{e}（开关已拨回）"),
+        }
+    }
+
     fn set_event_driven(&mut self, on: bool) -> String {
         if self.config.event_driven == on {
             return format!("事件驱动已经是{}状态", if on { "开启" } else { "关闭" });
@@ -488,6 +542,19 @@ impl AppState {
         println!("---- 退出，开始还原 ----");
         let msg = self.restore_all();
         println!("{msg}");
+    }
+
+    /// 用户点了窗口的关闭按钮。
+    ///
+    /// 这只是把窗口藏起来，**不是退出** —— 退出要走托盘菜单的「退出并还原」，
+    /// 那条路会先把改过的音频路由还回去。藏窗口时什么都不用做：路由照旧跟着走，
+    /// 托盘图标也还在。唯一要做的是留一句话，免得用户以为程序已经退了
+    /// （下次打开窗口时能在日志里看到）。
+    fn note_window_hidden(&mut self) {
+        if self.quitting {
+            return;
+        }
+        self.log("窗口已关闭，程序仍在后台运行：右键托盘图标可再次打开设置，或退出并还原");
     }
 
     /// 处理来自托盘线程的事件。
@@ -626,11 +693,16 @@ impl AppState {
         ui.set_auto_follow(self.config.auto_follow);
         ui.set_event_driven(self.config.event_driven);
         ui.set_hook_live(self.hook.is_some());
+        ui.set_startup(self.startup);
     }
 }
 
-/// 启动界面与常驻逻辑。`dpi` 只用于在日志里如实报告生效的 DPI 模式。
-pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
+/// 启动界面与常驻逻辑。
+///
+/// `dpi` 只用于在日志里如实报告生效的 DPI 模式。
+/// `show_window` 为 false 时窗口保持隐藏（开机自动启动用它，避免登录时弹窗打扰），
+/// 用户仍可从托盘菜单打开。
+pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformError> {
     // 必须在创建窗口之前就把 COM 初始化成 **STA**。
     //
     // slint 的 Windows 后端是 winit，而 winit 在建窗时会调用 `OleInitialize`。
@@ -738,6 +810,20 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
     {
         let st = state.clone();
         let w = ui.as_weak();
+        ui.on_toggle_startup(move |on| {
+            let Some(ui) = w.upgrade() else { return };
+            let mut s = st.borrow_mut();
+            let msg = s.set_startup(on);
+            s.log(msg);
+            // set_startup 只在自己成功时才改状态，所以这里推一次就会把
+            // 写注册表失败的情况拨回开关原状。
+            s.sync_to_ui(&ui);
+        });
+    }
+
+    {
+        let st = state.clone();
+        let w = ui.as_weak();
         ui.on_restore_all(move || {
             let Some(ui) = w.upgrade() else { return };
             let mut s = st.borrow_mut();
@@ -748,6 +834,25 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
     }
 
     state.borrow_mut().sync_to_ui(&ui);
+
+    // 窗口的关闭按钮 = 隐藏到托盘，不是退出。
+    //
+    // slint 的默认动作**本来就**是隐藏（`CloseRequestResponse::HideWindow` 是默认值），
+    // 坑在事件循环上 —— 见下面 `run_event_loop_until_quit` 那段。这里只留一句话，
+    // 免得用户以为程序已经退了。
+    {
+        let st = state.clone();
+        ui.window().on_close_requested(move || {
+            if let Ok(mut s) = st.try_borrow_mut() {
+                s.note_window_hidden();
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    if show_window {
+        ui.show()?;
+    }
 
     let timer = slint::Timer::default();
     {
@@ -774,7 +879,15 @@ pub fn run(dpi: DpiAwareness) -> Result<(), slint::PlatformError> {
         );
     }
 
-    let result = ui.run();
+    // 不用 `ComponentHandle::run()`：它内部是 `run_event_loop()`，语义是
+    // **"最后一个窗口关闭后返回"——而且 `hide()` 也算关闭**。窗口一藏进托盘，
+    // 事件循环立刻返回，紧接着下面的 `shutdown()` 把路由还原、进程退出，
+    // 表现成"点关闭 = 程序直接退出"（这正是之前那个 bug 的根因）。
+    //
+    // `run_event_loop_until_quit()` 则在没有任何可见窗口时也继续跑，
+    // 直到 `quit_event_loop()` 被调用。我们的退出不走 slint ——
+    // 托盘菜单还原完会让托盘线程直接 `process::exit`。
+    let result = slint::run_event_loop_until_quit();
     // 无论正常退出还是出错退出，都要把改过的路由还回去
     state.borrow_mut().shutdown();
     result
