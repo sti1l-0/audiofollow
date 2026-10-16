@@ -2,6 +2,10 @@
 # 注意：Cargo.lock 需要提交（这是二进制应用，不是库）
 target/
 
+# rc.exe 的中间临时文件（`RCa28564` 这种名字）。正常情况下它自己会删掉，
+# 但 `/fo` 的输出被占用时会留在源文件旁边 —— 上一轮排查图标问题时留了一个。
+crates/audiofollow/win/RC[0-9a-f]*
+
 # ---- 第三方源码，仅供研究，不随仓库分发 ----
 # SoundSwitch(GPL-3.0) / EarTrumpet(MIT) 的解压目录与下载包
 research/
