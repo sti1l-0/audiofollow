@@ -277,34 +277,42 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // 两个全局开关：右起「自动跟随」，「开机启动」在它左边。
-            // 位置靠**引用另一个元素的 x** 推出来，不用布局 —— slint 里固定尺寸
+            // 两个全局开关：右起「自动跟随」，它的左边是「开机启动」。
+            // 每一组都是「文字在左、开关在右」，整组从窗口右边界往回推。
+            //
+            // 位置靠**引用相邻元素的 x** 推出来，不用布局 —— slint 里固定尺寸
             // 元素（Switch）在布局中的垂直落点不可控（实测差 15px），绝对定位最稳。
-            auto-label := Text {
-                text: "自动跟随";
-                font-size: 13px;
-                color: Theme.text-2;
-                x: parent.width - 36px - 8px - self.width;
-                y: (parent.height - self.height) / 2;
-            }
-            Switch {
+            //
+            // ⚠️ 开关的宽度必须算在**自己那一组**里。第一版把「开机启动」的开关
+            // 摆在自己文字的右边（`x: startup-label.x + startup-label.width + 8px`），
+            // 结果它右半截压到了「自动跟随」四个字上：4 个 13px 汉字约 52px 宽，
+            // 而两组之间只留了 24px。这类"漏算自己宽度"的错目视截图很容易放过，
+            // 所以下面这四个 x 全部由**相邻元素的真实 x 反推**，不写字面量。
+            auto-switch := Switch {
                 checked <=> root.auto-follow;
                 toggled(on) => { root.toggle-auto-follow(on); }
                 x: parent.width - self.width;
                 y: (parent.height - self.height) / 2;
             }
+            auto-label := Text {
+                text: "自动跟随";
+                font-size: 13px;
+                color: Theme.text-2;
+                x: auto-switch.x - 8px - self.width;
+                y: (parent.height - self.height) / 2;
+            }
 
+            startup-switch := Switch {
+                checked <=> root.startup;
+                toggled(on) => { root.toggle-startup(on); }
+                x: auto-label.x - 24px - self.width;
+                y: (parent.height - self.height) / 2;
+            }
             startup-label := Text {
                 text: "开机启动";
                 font-size: 13px;
                 color: Theme.text-2;
-                x: auto-label.x - 24px - self.width;
-                y: (parent.height - self.height) / 2;
-            }
-            Switch {
-                checked <=> root.startup;
-                toggled(on) => { root.toggle-startup(on); }
-                x: startup-label.x + startup-label.width + 8px;
+                x: startup-switch.x - 8px - self.width;
                 y: (parent.height - self.height) / 2;
             }
         }
