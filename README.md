@@ -145,7 +145,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 
 选这个位置的理由：**不需要管理员权限**（写 `HKLM` 才要提权，一个托盘小工具为开机启动弹 UAC 不划算），用户还能在「任务管理器 → 启动应用」里自己看见并禁用——这是系统给用户的正规入口。
 
-注册表里存的是 exe 的**绝对路径**，所以程序换目录之后记录会失效。每次启动都会拿当前路径和记录比对一次，不一致就用当前路径改写。scoop 安装尤其依赖这个自愈：`current` 只是符号链接，而程序自己看到的是解析后的版本化目录（`apps\audiofollow\0.1.1\audiofollow.exe`），每次 `scoop update` 都会变。
+注册表里存的是 exe 的**绝对路径**，所以程序换目录之后记录会失效。每次启动都会拿当前路径和记录比对一次，不一致就用当前路径改写。scoop 安装尤其依赖这个自愈：`current` 只是符号链接，而程序自己看到的是解析后的版本化目录（`apps\audiofollow\<版本>\audiofollow.exe`），每次 `scoop update` 都会变。
 
 ---
 

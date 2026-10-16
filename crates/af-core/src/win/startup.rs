@@ -14,7 +14,7 @@
 //! 这条记录会静默失效（系统找不到文件就不启动，不会报错）。
 //! 所以每次启动都拿当前路径和记录比对一次，不一致就改写 —— 见 [`sync_to_current_exe`]。
 //! scoop 安装尤其依赖这个自愈：`current` 只是符号链接，而 `current_exe()` 给的是
-//! **解析之后**的版本化目录（`apps\audiofollow\0.1.1\audiofollow.exe`），
+//! **解析之后**的版本化目录（`apps\audiofollow\<版本>\audiofollow.exe`），
 //! 每次 `scoop update` 之后这个路径都会变。
 
 use std::path::Path;
