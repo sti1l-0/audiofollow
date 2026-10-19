@@ -5,11 +5,13 @@
 //! ## 分层
 //!
 //! ```text
-//! config      配置持久化（%APPDATA%\AudioFollow\config.json）
+//! config      配置持久化（%APPDATA%\AudioFollow\config.json）+ 绑定匹配判据
+//! config::heal  设备记忆的「治愈」：认回换编号的显示器、换 ID 的声卡
 //! win         显示器枚举 + 顶层窗口枚举 + 「窗口属于哪块屏」+ 进程树 + 事件钩子
 //! audio       Core Audio 互操作；其中 policy 模块是未公开的按应用路由接口
 //! plan        纯计算：窗口 → 屏幕 → 设备 的映射计划（含多进程应用的后代展开）
 //! reconcile   差量执行计划，并负责备份与还原
+//! scan        设备扫描的决策：新旧快照比对 + 治愈编排（纯函数，可单测）
 //! ```
 //!
 //! ## 典型用法
@@ -64,6 +66,11 @@ pub mod audio;
 pub mod config;
 pub mod plan;
 pub mod reconcile;
+pub mod scan;
 pub mod win;
+
+/// 测试共用的设备与绑定构造器，仅测试构建编译。
+#[cfg(test)]
+pub mod testing;
 
 pub use win::Rect;

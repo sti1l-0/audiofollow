@@ -164,7 +164,9 @@ pub struct WindowEventHook {
 }
 
 impl WindowEventHook {
-    /// 装上「窗口位置/显隐/创建销毁」和「前台切换/最小化」两类事件。
+    /// 装上三段钩子：创建/销毁/显隐（`0x8000..=0x8003`）、位置变化（`0x800B`）、
+    /// 系统级前台切换/最小化（`0x0003..=0x0017`）。范围怎么取舍、砍掉了哪些
+    /// 噪声事件，见线程闭包里的注释。
     pub fn install() -> Result<Self, String> {
         EVENTS.store(0, Ordering::Relaxed);
         CALLS.store(0, Ordering::Relaxed);
@@ -178,10 +180,16 @@ impl WindowEventHook {
             .spawn(move || unsafe {
                 let mut handles: Vec<ffi::HWINEVENTHOOK> = Vec::new();
 
-                // 对象级：窗口创建/销毁/显示/隐藏/位置变化。范围 0x8000..=0x800C。
+                // 对象级·其一：窗口创建/销毁/显示/隐藏（0x8000..=0x8003）。
+                //
+                // 刻意**不**把范围一口气拉到 0x800C：中间夹着的 REORDER / FOCUS /
+                // SELECTION×4 / STATECHANGE 与"窗口在哪块屏"毫无关系，却同样通过
+                // OBJID_WINDOW 过滤、同样置脏。持续变标题的应用（音乐播放器滚动
+                // 歌名）叠加 1s 去抖上限，会造成每秒一次全量同步（进程快照 + 会话
+                // 枚举）白做。
                 let h1 = ffi::SetWinEventHook(
                     ffi::EVENT_OBJECT_CREATE,
-                    ffi::EVENT_OBJECT_NAMECHANGE,
+                    ffi::EVENT_OBJECT_HIDE,
                     0, // hmod：进程内钩子传 0
                     Some(win_event_proc),
                     0, // 全部进程
@@ -192,10 +200,11 @@ impl WindowEventHook {
                     handles.push(h1);
                 }
 
-                // 系统级：前台切换、最小化/还原。范围 0x0001..=0x0017。
+                // 对象级·其二：位置变化（0x800B，单点）。归属判定只看窗口矩形，
+                // 矩形不动（标题变、焦点变、状态变）就不需要重新判定。
                 let h2 = ffi::SetWinEventHook(
-                    ffi::EVENT_SYSTEM_FOREGROUND,
-                    ffi::EVENT_SYSTEM_MINIMIZEEND,
+                    ffi::EVENT_OBJECT_LOCATIONCHANGE,
+                    ffi::EVENT_OBJECT_LOCATIONCHANGE,
                     0,
                     Some(win_event_proc),
                     0,
@@ -204,6 +213,22 @@ impl WindowEventHook {
                 );
                 if h2 != 0 {
                     handles.push(h2);
+                }
+
+                // 系统级：前台切换、最小化/还原（0x0003..=0x0017）。
+                // 前台切换是另一条主路径：焦点从 A 屏的窗口换到 B 屏的窗口，
+                // 两块屏的规则可能不同，必须重新判定。
+                let h3 = ffi::SetWinEventHook(
+                    ffi::EVENT_SYSTEM_FOREGROUND,
+                    ffi::EVENT_SYSTEM_MINIMIZEEND,
+                    0,
+                    Some(win_event_proc),
+                    0,
+                    0,
+                    ffi::WINEVENT_OUTOFCONTEXT,
+                );
+                if h3 != 0 {
+                    handles.push(h3);
                 }
 
                 if handles.is_empty() {
@@ -256,7 +281,8 @@ impl WindowEventHook {
         LAST_ID.load(Ordering::Relaxed)
     }
 
-    /// 某事件编号的可读名字。只覆盖我们挂钩的那些。
+    /// 某事件编号的可读名字。覆盖我们关心的那些（含已不挂钩的 NAMECHANGE，
+    /// 供诊断输出对照原始事件缓冲时认得出来）。
     pub fn event_name(id: u32) -> &'static str {
         match id {
             ffi::EVENT_SYSTEM_FOREGROUND => "EVENT_SYSTEM_FOREGROUND（前台窗口切换）",

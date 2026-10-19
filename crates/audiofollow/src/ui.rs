@@ -136,9 +136,15 @@ struct AppState {
     // 如果每 100ms 重建一次下拉框的 model，用户正在选的那一项会被冲掉。
     pushed_monitors: Vec<String>,
     pushed_endpoints: Vec<String>,
-    /// 绑定行的签名（monitor, endpoint, enabled）。比较用，避免重建 model。
-    pushed_rules: Vec<(String, String, bool)>,
-    pushed_log_len: usize,
+    /// 绑定行缓存，直接整表比较（slint 结构体自带 PartialEq）：以后给 RuleRow
+    /// 加字段会自动参与比较，不会出现"忘了把新字段加进签名 → 界面不刷新"的沉默 bug。
+    pushed_rules: Vec<RuleRow>,
+    /// 日志序号：每写一行 +1。
+    ///
+    /// **不能按长度判断**：到达上限后长度恒等于 `LOG_LIMIT`（推一条、挤掉一条），
+    /// 按长度比较的话界面日志会从第 401 行起永远不再刷新——真实存在的坑。
+    log_seq: u64,
+    pushed_log_seq: u64,
 }
 
 impl AppState {
@@ -169,7 +175,8 @@ impl AppState {
             pushed_monitors: Vec::new(),
             pushed_endpoints: Vec::new(),
             pushed_rules: Vec::new(),
-            pushed_log_len: usize::MAX,
+            log_seq: 0,
+            pushed_log_seq: u64::MAX,
         };
         if let Some(w) = warn {
             me.log(w);
@@ -212,6 +219,7 @@ impl AppState {
             let drop = self.log.len() - LOG_LIMIT;
             self.log.drain(0..drop);
         }
+        self.log_seq += 1;
     }
 
     // ---------------------------------------------------------- 事件驱动 ----
@@ -306,12 +314,13 @@ impl AppState {
         self.refresh_devices(false);
     }
 
-    /// 扫一遍显示器与音频设备，与上一轮比对，然后做**记忆治愈**。
+    /// 扫一遍显示器与音频设备，交给 [`af_core::scan`] 决策，然后照单执行。
     ///
     /// 这是「设备记忆」的入口。显示器拔掉重插后系统可能给它换设备名（`DISPLAY2`
-    /// 变 `DISPLAY3`）、声卡换接口后端点 ID 会变——两者都会让绑定"看起来失效"。
-    /// [`AppConfig::heal_against`] 按稳定标识（EDID 身份哈希 / 设备名）把它们认回来，
-    /// 修好后立刻强制一轮同步，用户不用做任何事。
+    /// 变 `DISPLAY3`）、声卡换接口后端点 ID 会变——两者都会让绑定"看起来失效"，
+    /// 由扫描决策层按稳定标识认回来。决策逻辑（变化怎么报、何时治愈、何时强制
+    /// 同步）全部在 `af_core::scan` 里单测覆盖；这里只剩 IO：枚举、打日志、落盘、
+    /// 触发同步。
     ///
     /// `verbose` 为真时完整列出当前设备（启动与手动扫描用）；周期扫描只报变化，
     /// 否则每 4 秒刷一遍设备清单。
@@ -342,14 +351,8 @@ impl AppState {
         }
 
         let monitors = win::monitor::enumerate();
-        let endpoints = match self.env.as_ref().map(|e| e.endpoints()) {
-            Some(Ok(eps)) => {
-                if !verbose && !self.endpoints_ok {
-                    self.log("音频设备枚举已恢复");
-                }
-                self.endpoints_ok = true;
-                eps
-            }
+        let (endpoints, endpoints_ok_now) = match self.env.as_ref().map(|e| e.endpoints()) {
+            Some(Ok(eps)) => (eps, true),
             Some(Err(e)) => {
                 if verbose || self.endpoints_ok {
                     self.log(format!("枚举音频设备失败：{e}"));
@@ -357,82 +360,32 @@ impl AppState {
                 self.endpoints_ok = false;
                 return; // 端点列表不可信，本轮不更新、不治愈
             }
-            None => Vec::new(),
+            None => (Vec::new(), false),
         };
 
-        // ---- 与上一轮比对 ----
-        //
-        // 比对集合借着 self.monitors/self.endpoints，而打日志要 &mut self，
-        // 所以先把要说的攒进局部 Vec，出了这个块再打。
-        let (changed, diff_logs) = {
-            let old_mon: HashSet<&str> = self.monitors.iter().map(|m| m.device.as_str()).collect();
-            let new_mon: HashSet<&str> = monitors.iter().map(|m| m.device.as_str()).collect();
-            let old_ep: HashSet<&str> = self.endpoints.iter().map(|e| e.id.as_str()).collect();
-            let new_ep: HashSet<&str> = endpoints.iter().map(|e| e.id.as_str()).collect();
-
-            let mut logs: Vec<String> = Vec::new();
-            // 新增的设备：verbose 模式下面的清单会完整列出，逐条报"已连接"就重复了
-            if !verbose {
-                for m in &monitors {
-                    if !old_mon.contains(m.device.as_str()) {
-                        logs.push(format!(
-                            "显示器已连接：{}",
-                            win::monitor::name_from_device(&m.device)
-                        ));
-                    }
-                }
-                for e in &endpoints {
-                    if !old_ep.contains(e.id.as_str()) {
-                        logs.push(format!("音频设备已出现：{}", e.name));
-                    }
-                }
-            }
-            // 消失的设备两种模式都要报：清单里看不到"少了什么"
-            for m in &self.monitors {
-                if !new_mon.contains(m.device.as_str()) {
-                    logs.push(format!(
-                        "显示器已断开：{}（绑定保留，重新接入后自动恢复）",
-                        win::monitor::name_from_device(&m.device)
-                    ));
-                }
-            }
-            for e in &self.endpoints {
-                if !new_ep.contains(e.id.as_str()) {
-                    logs.push(format!("音频设备已移除：{}", e.name));
-                }
-            }
-            (old_mon != new_mon || old_ep != new_ep, logs)
-        };
-        for l in diff_logs {
-            self.log(l);
-        }
-
-        if verbose {
-            self.log(format!("检测到 {} 块显示器", monitors.len()));
-            for (i, m) in monitors.iter().enumerate() {
-                self.log(format!("  {}", m.label(i)));
-            }
-            self.log(format!("检测到 {} 个音频输出设备", endpoints.len()));
-            for (i, ep) in endpoints.iter().enumerate() {
-                self.log(format!("  {}", ep.label(i)));
-            }
-        }
-
+        let outcome = af_core::scan::scan(
+            &mut self.config,
+            &self.monitors,
+            &self.endpoints,
+            &monitors,
+            &endpoints,
+            verbose,
+            self.endpoints_ok,
+            endpoints_ok_now,
+        );
         self.monitors = monitors;
         self.endpoints = endpoints;
+        self.endpoints_ok = endpoints_ok_now;
 
-        // ---- 记忆治愈：换编号的显示器、换 ID 的声卡，在这里认回来 ----
-        let notes = self.config.heal_against(&self.monitors, &self.endpoints);
-        for n in &notes {
-            self.log(n);
+        for l in outcome.log_lines {
+            self.log(l);
         }
-        if !notes.is_empty() {
+        if outcome.config_changed {
             if let Err(e) = self.config.save() {
                 self.log(format!("保存配置失败：{e}"));
             }
         }
-
-        if changed || !notes.is_empty() {
+        if outcome.force_sync {
             // 设备集变了或绑定恢复了：下一轮同步不等轮询周期，立刻执行
             self.last_sync = Instant::now() - Duration::from_secs(3600);
         }
@@ -935,17 +888,13 @@ impl AppState {
                 }
             })
             .collect();
-        let sig: Vec<(String, String, bool)> = rows
-            .iter()
-            .map(|r| (r.monitor.to_string(), r.endpoint.to_string(), r.enabled))
-            .collect();
-        if sig != self.pushed_rules {
-            self.pushed_rules = sig;
+        if rows != self.pushed_rules {
+            self.pushed_rules = rows.clone();
             ui.set_rules(slint::ModelRc::new(slint::VecModel::from(rows)));
         }
 
-        if self.log.len() != self.pushed_log_len {
-            self.pushed_log_len = self.log.len();
+        if self.log_seq != self.pushed_log_seq {
+            self.pushed_log_seq = self.log_seq;
             ui.set_log_entries(slint::ModelRc::new(slint::VecModel::from(self.log.clone())));
         }
 
@@ -1189,21 +1138,33 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
             Duration::from_millis(PUMP_MS),
             move || {
                 let Some(ui) = w.upgrade() else { return };
-                let mut s = st.borrow_mut();
-                while let Ok(ev) = rx.try_recv() {
-                    s.handle_tray(ev, &ui);
+                // panic 防护：这个回调浓缩了全部运行逻辑，任何一处越界/unwrap 在
+                // panic=abort 的配置下都会直接杀进程、跳过还原，把改过的路由留在
+                // 系统里。接住 panic、留痕、下一轮继续——「退出必还原」的承诺比
+                // 一次崩溃的体面重要（release 因此不再设 panic=abort，见 Cargo.toml）。
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut s = st.borrow_mut();
+                    while let Ok(ev) = rx.try_recv() {
+                        s.handle_tray(ev, &ui);
+                    }
+                    if s.quitting {
+                        // 收到退出指令了：还原已经做完，剩下的交给托盘线程收工。
+                        // 这时候再去 pump/maybe_sync 会把刚还回去的路由又改一遍。
+                        return;
+                    }
+                    // 设备扫描放在最前面：拔插显示器 / 声卡回来的那一刻，先让
+                    // 记忆治愈修好绑定，紧接着的 maybe_sync 就能按新状态路由
+                    s.maybe_refresh_devices();
+                    s.pump_events();
+                    s.maybe_sync();
+                    s.sync_to_ui(&ui);
+                }));
+                if ok.is_err() {
+                    // RefCell 的借用在栈展开时已释放，这里能重新借到
+                    if let Ok(mut s) = st.try_borrow_mut() {
+                        s.log("内部错误：本轮处理发生 panic，已跳过并继续运行；若反复出现请反馈");
+                    }
                 }
-                if s.quitting {
-                    // 收到退出指令了：还原已经做完，剩下的交给托盘线程收工。
-                    // 这时候再去 pump/maybe_sync 会把刚还回去的路由又改一遍。
-                    return;
-                }
-                // 设备扫描放在最前面：拔插显示器 / 声卡回来的那一刻，先让记忆治愈
-                // 修好绑定，紧接着的 maybe_sync 就能按新状态路由，不用等下一轮
-                s.maybe_refresh_devices();
-                s.pump_events();
-                s.maybe_sync();
-                s.sync_to_ui(&ui);
             },
         );
     }

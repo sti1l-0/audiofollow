@@ -12,7 +12,7 @@ use af_core::audio::policy::PersistedRoute;
 use af_core::audio::{AudioEnv, Role};
 use af_core::config::AppConfig;
 use af_core::plan;
-use af_core::win::{self, hook::WindowEventHook, window, ProcTree};
+use af_core::win::{self, hook::WindowEventHook, window, Monitor, ProcTree, WindowInfo};
 
 fn rule(title: &str) {
     println!();
@@ -122,12 +122,52 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
     // ---------------- [4] 窗口与归属 ----------------
     rule("[4] 顶层窗口 → 显示器");
     let windows = window::enumerate_app_windows();
+    section_windows(&monitors, &windows, self_pid);
+
+    // ---------------- [5] 进程树与多进程覆盖 ----------------
+    rule("[5] 进程树与多进程覆盖");
+    let tree = ProcTree::snapshot();
+    let sessions = env.session_pids();
+    section_process_tree(&tree, &windows, &sessions, self_pid);
+
+    // ---------------- [6] 路由计划 ----------------
+    rule("[6] 路由计划（纯计算，尚未写入）");
+    section_plan(&config, &monitors, &windows, &endpoints, &tree, &sessions, self_pid);
+
+    // ---------------- [7] 音频会话（诊断） ----------------
+    rule("[7] 当前有音频会话的进程（诊断用，不参与路由决策）");
+    section_sessions(&env, &sessions);
+
+    // ---------------- [8] 事件钩子 ----------------
+    rule("[8] 窗口事件钩子（实时性）");
+    if let Err(e) = hook_probe(false) {
+        println!("  {e}");
+    }
+
+    // ---------------- [9] 可选的写入往返 ----------------
+    if write_test {
+        rule("[9] 写入往返验证（可回滚）");
+        return write_roundtrip(&env, &endpoints, args);
+    }
+
+    rule("完成");
+    println!("  本次未向系统写入任何内容（只读自检）。");
+    println!("  要验证写入路径，运行： audiofollow --write-test");
+    println!("  要单独验证事件钩子，运行： audiofollow --hook-test");
+    0
+}
+
+// ---------------------------------------------------------------- [4]–[7] ----
+// run() 的分段实现。从 run() 里拆出来是因为它已经长到接近 300 行——
+// 每段一个函数后，run() 只剩"数据从哪来、段按什么顺序跑"的编排。
+
+fn section_windows(monitors: &[Monitor], windows: &[WindowInfo], self_pid: u32) {
     let mut shown = 0usize;
-    for w in &windows {
+    for w in windows {
         if w.pid == self_pid {
             continue;
         }
-        let mi = window::monitor_index_for(&monitors, w);
+        let mi = window::monitor_index_for(monitors, w);
         let target = match mi {
             Some(i) => monitors[i].label(i),
             None => "<无归属>".to_string(),
@@ -148,15 +188,14 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
         }
     }
     println!("  共 {} 个顶层窗口", windows.len());
+}
 
-    // ---------------- [5] 进程树与多进程覆盖 ----------------
-    rule("[5] 进程树与多进程覆盖");
-    let tree = ProcTree::snapshot();
+fn section_process_tree(tree: &ProcTree, windows: &[WindowInfo], sessions: &[u32], self_pid: u32) {
     println!("  快照进程数      : {}", tree.len());
 
     // 每个"持有窗口的进程"，看它有多少**同名**后代（这些会被一起改道）
     let mut owners: Vec<(u32, String)> = Vec::new();
-    for w in &windows {
+    for w in windows {
         if w.pid == self_pid {
             continue;
         }
@@ -205,11 +244,10 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
     // 谁在出声，以及它会不会被改道覆盖到
     println!();
     println!("  正在出声的进程，是否落在某个窗口进程的同名子树里：");
-    let sessions = env.session_pids();
     if sessions.is_empty() {
         println!("    （当前没有音频会话——放点声音再跑一次就能看到）");
     }
-    for pid in &sessions {
+    for pid in sessions {
         if *pid == self_pid {
             continue;
         }
@@ -233,16 +271,24 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
             ),
         }
     }
+}
 
-    // ---------------- [6] 路由计划 ----------------
-    rule("[6] 路由计划（纯计算，尚未写入）");
+fn section_plan(
+    config: &AppConfig,
+    monitors: &[Monitor],
+    windows: &[WindowInfo],
+    endpoints: &[AudioEndpoint],
+    tree: &ProcTree,
+    sessions: &[u32],
+    self_pid: u32,
+) {
     let p = plan::build(&plan::Inputs {
-        config: &config,
-        monitors: &monitors,
-        windows: &windows,
-        endpoints: &endpoints,
-        tree: &tree,
-        sessions: &sessions,
+        config,
+        monitors,
+        windows,
+        endpoints,
+        tree,
+        sessions,
         self_pid,
     });
     if p.is_empty() {
@@ -275,38 +321,20 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
     for n in &p.notes {
         println!("  说明：{n}");
     }
+}
 
-    // ---------------- [7] 音频会话（诊断） ----------------
-    rule("[7] 当前有音频会话的进程（诊断用，不参与路由决策）");
+fn section_sessions(env: &AudioEnv, sessions: &[u32]) {
     if sessions.is_empty() {
         println!("  （没有活跃音频会话——放点声音再跑一次就能看到）");
     }
-    for pid in &sessions {
+    for pid in sessions {
         let name = window::process_name(*pid).unwrap_or_else(|| "?".into());
-        let sub = match read_role(&env, *pid, Role::Console) {
+        let sub = match read_role(env, *pid, Role::Console) {
             Ok(r) => r.describe(),
             Err(e) => format!("读取失败 {e}"),
         };
         println!("  {:>7}  {:<24} 控制音：{}", pid, truncate(&name, 24), sub);
     }
-
-    // ---------------- [8] 事件钩子 ----------------
-    rule("[8] 窗口事件钩子（实时性）");
-    if let Err(e) = hook_probe(false) {
-        println!("  {e}");
-    }
-
-    // ---------------- [9] 可选的写入往返 ----------------
-    if write_test {
-        rule("[9] 写入往返验证（可回滚）");
-        return write_roundtrip(&env, &endpoints, args);
-    }
-
-    rule("完成");
-    println!("  本次未向系统写入任何内容（只读自检）。");
-    println!("  要验证写入路径，运行： audiofollow --write-test");
-    println!("  要单独验证事件钩子，运行： audiofollow --hook-test");
-    0
 }
 
 /// 验证事件钩子。

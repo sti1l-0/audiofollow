@@ -15,8 +15,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]
-# 托盘常驻程序：优先体积与稳定性，放开 LTO
+# 托盘常驻程序：优先稳定性与体积，放开 LTO
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+# 刻意**不**设 panic = "abort"：主循环的定时器回调浓缩了全部运行逻辑，一处
+# panic 直接杀进程会跳过「退出时还原音频路由」的承诺。保留栈展开才能用
+# catch_unwind 接住 panic、留痕、继续跑（见 ui.rs 定时器回调）——
+# 这比二进制小几百 KB 重要。
