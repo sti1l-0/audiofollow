@@ -48,6 +48,9 @@ pub struct Guid {
     pub d4: [u8; 8],
 }
 
+// GUID 是 COM 调用的"类型标识"，布局错了 QI/激活会拿到不相干接口的 vtable。
+const _: () = assert!(std::mem::size_of::<Guid>() == 16);
+
 impl Guid {
     pub const fn new(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> Self {
         Guid { d1, d2, d3, d4 }
@@ -343,11 +346,6 @@ impl HString {
 
     pub fn as_raw(&self) -> *mut c_void {
         self.h
-    }
-
-    /// 空 HSTRING 表示"字符串为空"，不是"没有 HSTRING"。
-    pub fn is_empty(&self) -> bool {
-        self.h.is_null() || self.to_string().is_empty()
     }
 
     pub fn to_string(&self) -> String {

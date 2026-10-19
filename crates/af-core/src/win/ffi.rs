@@ -35,6 +35,9 @@ pub struct Rect {
     pub bottom: i32,
 }
 
+// 4 × i32。`GetWindowRect` / `DwmGetWindowAttribute` 直接往里写，错一位全盘错。
+const _: () = assert!(std::mem::size_of::<Rect>() == 16);
+
 impl Rect {
     pub fn new(left: i32, top: i32, right: i32, bottom: i32) -> Self {
         Self { left, top, right, bottom }
@@ -104,6 +107,10 @@ pub struct MONITORINFOEXW {
     pub szDevice: [u16; CCHDEVICENAME],
 }
 
+// 4 + 16 + 16 + 4 + 64。`GetMonitorInfoW` 按这个布局回填，`szDevice` 错位意味着
+// 设备名（配置的锚点）读出来是空或乱的。
+const _: () = assert!(std::mem::size_of::<MONITORINFOEXW>() == 104);
+
 /// 与 Win32 `DISPLAY_DEVICEW` 二进制兼容。用来取显示器的**用户可辨认名称**
 /// （`MONITORINFOEXW` 只给 `\\.\DISPLAY1` 这种设备名）。
 ///
@@ -141,6 +148,8 @@ pub struct SYSTEMTIME {
     pub milliseconds: u16,
 }
 
+const _: () = assert!(std::mem::size_of::<SYSTEMTIME>() == 16);
+
 /// 与 Win32 `FILETIME` 二进制兼容。单位为 100 ns，起点 1601-01-01。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -148,6 +157,8 @@ pub struct FILETIME {
     pub dwLowDateTime: u32,
     pub dwHighDateTime: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<FILETIME>() == 8);
 
 impl FILETIME {
     /// 拼成便于比较的 64 位值。只比大小，不做日期换算。
@@ -175,12 +186,22 @@ pub struct PROCESSENTRY32W {
     pub szExeFile: [u16; MAX_PATH],
 }
 
+// 进程树（父 pid 展开）全靠这份快照，`th32ParentProcessID` 错位会认错爹、
+// 改错别人的音频路由。x64：44 字节头部（含 4 字节对齐填充）+ 520 字节数组，
+// 末尾补齐到 8 的倍数 = 568；x86：36 + 520 = 556。
+const _: () = assert!(
+    std::mem::size_of::<PROCESSENTRY32W>()
+        == if cfg!(target_pointer_width = "64") { 568 } else { 556 }
+);
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct POINT {
     pub x: i32,
     pub y: i32,
 }
+
+const _: () = assert!(std::mem::size_of::<POINT>() == 8);
 
 /// 与 Win32 `MSG` 二进制兼容。
 #[repr(C)]
@@ -195,6 +216,12 @@ pub struct MSG {
     /// Vista 起多出来的字段，`GetMessageW` 会往里写，必须有。
     pub lPrivate: DWORD,
 }
+
+// x64：8+4(+4 填充)+8+8+4+8+4 = 48；x86：4+4+4+4+4+8+4 = 32。
+const _: () = assert!(
+    std::mem::size_of::<MSG>()
+        == if cfg!(target_pointer_width = "64") { 48 } else { 32 }
+);
 
 /// `SetWinEventHook` 的回调原型。`CALLBACK` 即 `extern "system"`。
 pub type WINEVENTPROC = unsafe extern "system" fn(

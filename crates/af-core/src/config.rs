@@ -1,8 +1,16 @@
 //! 配置持久化。落在 `%APPDATA%\AudioFollow\config.json`。
 //!
-//! 配置里只存**用户意图**：哪块屏幕对哪个音频设备。运行期的状态（改过哪些进程、
+//! 配置里存的是**用户意图**：哪块屏幕对哪个音频设备。运行期的状态（改过哪些进程、
 //! 每个进程原来的值是什么）不落盘——那是临时数据，重启后应当重新判断。
+//!
+//! # 设备记忆
+//!
+//! 绑定从来**不因设备离线而删除**：显示器拔掉重插、USB 声卡换口，都是用户迟早会
+//! 接回来的东西，删了绑定等于替用户忘掉他配好的组合。离线的绑定只是挂起
+//! （界面标注「不在线」），设备回来时由 [`AppConfig::heal_against`] 按稳定标识认出
+//! 「同一块屏 / 同一个声卡」，自动把绑定修回可用状态。
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -27,14 +35,25 @@ fn default_version() -> u32 {
 /// 一条「屏幕 → 音频设备」的绑定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenRule {
-    /// 显示器设备名，形如 `\\.\DISPLAY1`。这是稳定标识，显示器拔插后编号可能变，
-    /// 但同一台机器上它是系统给的、比"第 2 块屏"可靠。
+    /// 显示器设备名，形如 `\\.\DISPLAY1`。
+    ///
+    /// **只在本次连接内稳定**：拔插后系统可能重新编号。跨拔插认出"同一块屏"靠
+    /// [`Self::monitor_key`]，设备名由 [`AppConfig::heal_against`] 在扫描时对齐到当前值。
     pub monitor_device: String,
     /// 只用于展示（显示器型号名）。**型号取不到时是空串**，展示时退回「显示器 N」，
     /// 见 [`monitor::name_from_device`]。
     #[serde(default)]
     pub monitor_name: String,
+    /// 显示器的稳定标识（EDID 身份哈希，见 [`crate::win::Monitor::key`]）。
+    ///
+    /// 旧配置里没有这个字段（`None`），此时只能按设备名匹配——和旧版行为一致。
+    /// 同型号双屏（EDID 序列号都是 0）会撞同一个键，这种键在上层按"有歧义"处理。
+    #[serde(default)]
+    pub monitor_key: Option<String>,
     /// 音频端点原始 ID（不带 SWD 前缀）。
+    ///
+    /// 同一个物理声卡换接口/端口后 ID 会变；名字没变且当前无同名混淆时，
+    /// [`AppConfig::heal_against`] 会把这里修正到新 ID。
     pub endpoint_id: String,
     #[serde(default)]
     pub endpoint_name: String,
@@ -43,10 +62,16 @@ pub struct ScreenRule {
 }
 
 impl ScreenRule {
-    pub fn from_pair(monitor_device: &str, monitor_name: &str, endpoint: &AudioEndpoint) -> Self {
+    pub fn from_pair(
+        monitor_device: &str,
+        monitor_name: &str,
+        monitor_key: Option<&str>,
+        endpoint: &AudioEndpoint,
+    ) -> Self {
         Self {
             monitor_device: monitor_device.to_string(),
             monitor_name: monitor_name.to_string(),
+            monitor_key: monitor_key.map(str::to_string),
             endpoint_id: endpoint.id.clone(),
             endpoint_name: endpoint.name.clone(),
             enabled: true,
@@ -84,6 +109,14 @@ impl ScreenRule {
         } else {
             self.endpoint_name.clone()
         }
+    }
+
+    /// 这条绑定当前是否真的挂在这块在线显示器上。
+    ///
+    /// 与路由判定用同一把尺子（设备名 + 键 + 型号名三层，见 [`AppConfig::rule_for_monitor`]），
+    /// 界面据此区分「在线」「不在线」和「设备名被别的显示器顶了」三种状态。
+    pub fn matches_monitor(&self, m: &Monitor) -> bool {
+        rule_matches(self, &m.device, m.key.as_deref(), &m.name)
     }
 
     pub fn describe(&self) -> String {
@@ -184,22 +217,78 @@ impl AppConfig {
         let dir = Self::dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
         let path = dir.join("config.json");
-        let text = serde_json::to_string_pretty(self).map_err(|e| format!("序列化失败：{e}"))?;
-        std::fs::write(&path, text).map_err(|e| format!("写入失败：{e}"))?;
+        Self::save_to(self, &path)?;
         Ok(path)
     }
 
-    /// 某块屏幕上生效的规则。
-    pub fn rule_for_monitor(&self, monitor_device: &str) -> Option<&ScreenRule> {
-        self.rules
-            .iter()
-            .find(|r| r.monitor_device.eq_ignore_ascii_case(monitor_device) && r.enabled)
+    /// 原子地把配置写到指定路径。
+    ///
+    /// 先写**同目录**的临时文件并刷盘，再 rename 顶替正式文件。直接写正式文件的话，
+    /// 进程在写一半时被杀（断电、任务管理器）会留下半截 JSON——下次启动解析失败、
+    /// 回退默认配置，**全部绑定（也就是全部记忆）一次性丢光**。rename 顶替对读者
+    /// 而言只有"旧文件 / 新文件"两种状态，没有中间态（Windows 上 std 的 rename 带
+    /// `MOVEFILE_REPLACE_EXISTING`，可以顶掉已存在的目标）。
+    ///
+    /// rename 失败时（比如杀软短暂锁着正式文件）退回直接写：这时旧内容反正
+    /// 保不住了，把这次改动写进去比整体报错强。
+    fn save_to(cfg: &AppConfig, path: &std::path::Path) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(cfg).map_err(|e| format!("序列化失败：{e}"))?;
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let tmp = dir.join(format!(
+            "{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("config")
+        ));
+
+        let atomic = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?; // 刷到磁盘：rename 成功后断电，文件也是完整的
+            drop(f);
+            std::fs::rename(&tmp, path)
+        })();
+
+        match atomic {
+            Ok(()) => Ok(()),
+            Err(rename_err) => {
+                let _ = std::fs::remove_file(&tmp);
+                std::fs::write(path, &text).map_err(|e| {
+                    format!("写入失败（原子替换失败：{rename_err}；直写也失败：{e}）")
+                })
+            }
+        }
     }
 
-    /// 同一块屏只保留一条规则。
-    pub fn upsert_rule(&mut self, rule: ScreenRule) {
+    /// 某块屏幕上生效的规则。
+    ///
+    /// 匹配看三层：设备名相等、**键不冲突**、**型号名不冲突**。
+    /// 键冲突 = 这个设备名现在被另一块显示器顶着（拔插后系统重新编号）；
+    /// 型号名冲突 = 同样的位置换了台别的屏。两种情况都绝不能把旧规则套上去。
+    /// 任一侧没有键 / 名字（旧配置、读不到 EDID）时，退回纯设备名匹配。
+    pub fn rule_for_monitor(
+        &self,
+        monitor_device: &str,
+        monitor_key: Option<&str>,
+        monitor_name: &str,
+    ) -> Option<&ScreenRule> {
         self.rules
-            .retain(|r| !r.monitor_device.eq_ignore_ascii_case(&rule.monitor_device));
+            .iter()
+            .find(|r| rule_matches(r, monitor_device, monitor_key, monitor_name))
+    }
+
+    /// 同一块屏只保留一条规则：设备名相同**或**稳定标识相同都会被顶掉。
+    ///
+    /// 按键顶掉是为了防这种情况：显示器 X 的绑定还挂在旧设备名下（离线期间没来得及
+    /// 治愈），用户又手动给 X 现在的名字加了一条——不顶掉就会出现同一块屏两条规则。
+    /// 同型号双屏的键在上游（加规则时）已被判为歧义、不会写进规则，所以这里的按键
+    /// 顶掉不会误伤双屏各自的两条规则。
+    pub fn upsert_rule(&mut self, rule: ScreenRule) {
+        self.rules.retain(|r| {
+            let same_device = r.monitor_device.eq_ignore_ascii_case(&rule.monitor_device);
+            let same_key =
+                rule.monitor_key.is_some() && r.monitor_key.as_deref() == rule.monitor_key.as_deref();
+            !(same_device || same_key)
+        });
         self.rules.push(rule);
     }
 
@@ -210,24 +299,235 @@ impl AppConfig {
         self.rules.len() != before
     }
 
-    /// 清掉指向已不存在设备的规则（显示器被拔掉、声卡被移除之后）。
-    pub fn prune_missing(&mut self, monitors: &[&str], endpoint_ids: &[&str]) -> Vec<String> {
-        let mut dropped = Vec::new();
-        self.rules.retain(|r| {
-            let ok_monitor = monitors.iter().any(|d| d.eq_ignore_ascii_case(&r.monitor_device));
-            let ok_endpoint = endpoint_ids.iter().any(|id| *id == r.endpoint_id);
-            if !ok_monitor || !ok_endpoint {
-                dropped.push(r.describe());
+    /// 按当前实际在线的设备**治愈**绑定，实现"设备回来后按记忆恢复"。
+    ///
+    /// 只在真的改动了什么时返回非空说明（调用方据此落盘和提示）；没改动就返回空，
+    /// 这样周期扫描可以放心每几秒调一次而不会刷屏。分四个阶段：
+    ///
+    /// 1. **按键重绑**：规则的 [`ScreenRule::monitor_key`] 命中某块在线显示器
+    ///    （键无歧义），但设备名对不上 → 拔插后系统重新编号了，把设备名对齐到当前值。
+    ///    这是"记忆认人"的主路径。
+    /// 2. **按名认领**：没有键的旧规则（升级前的配置），设备名已经对不上任何在线屏
+    ///    （编号变了、或老位置被别的屏顶了），但型号名与某块在线屏一致且无歧义
+    ///    （在线屏里这个名字唯一、也没有别的同名规则）→ 认回。
+    /// 3. **补键**：无键规则按上面的判据还认得出自己的屏 → 把屏的稳定标识记下来。
+    ///    存量配置升级一次后就拥有 1 的记忆能力。
+    /// 4. **音频端点换 ID**：规则指向的端点 ID 不在活跃列表里，但恰有一个活跃端点
+    ///    与记住的设备名相同 → 同一个声卡换了接口（ID 变了名字没变），更新 ID。
+    ///    同名活跃端点多于一个（两个同型号 USB 声卡）时分不清，不动。
+    ///
+    /// 什么都不删：指向离线设备的绑定原样挂起，等设备回来。
+    pub fn heal_against(&mut self, monitors: &[Monitor], endpoints: &[AudioEndpoint]) -> Vec<String> {
+        let mut notes = Vec::new();
+
+        // 有歧义的键不参与任何认领：两块在线显示器共用一个键（同型号、EDID 序列号
+        // 都是 0）时，谁是谁分不清，动不如不动
+        let mut live_key_counts: HashMap<&str, usize> = HashMap::new();
+        for m in monitors {
+            if let Some(k) = m.key.as_deref() {
+                *live_key_counts.entry(k).or_insert(0) += 1;
             }
-            ok_monitor && ok_endpoint
-        });
-        dropped
+        }
+        let by_key: HashMap<&str, &Monitor> = monitors
+            .iter()
+            .filter_map(|m| {
+                let k = m.key.as_deref()?;
+                (live_key_counts.get(k) == Some(&1)).then_some((k, m))
+            })
+            .collect();
+        let dup_rule_keys: HashSet<String> = {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for r in &self.rules {
+                if let Some(k) = r.monitor_key.as_deref() {
+                    *counts.entry(k).or_insert(0) += 1;
+                }
+            }
+            counts
+                .into_iter()
+                .filter(|(_, c)| *c > 1)
+                .map(|(k, _)| k.to_string())
+                .collect()
+        };
+
+        // ---- 1) 按键重绑 ----
+        for r in &mut self.rules {
+            let Some(k) = r.monitor_key.clone() else { continue };
+            if dup_rule_keys.contains(&k) {
+                continue;
+            }
+            let Some(m) = by_key.get(k.as_str()).copied() else { continue };
+            if m.device.eq_ignore_ascii_case(&r.monitor_device) {
+                continue; // 设备名还对得上，无事可做
+            }
+            let old = r.monitor_device.clone();
+            r.monitor_device = m.device.clone();
+            if !m.name.is_empty() {
+                r.monitor_name = m.name.clone();
+            }
+            let label = r.monitor_display_in(monitors);
+            notes.push(format!(
+                "显示器「{label}」重新接入（{} → {}），已按记忆恢复绑定 → {}",
+                old, m.device, r.endpoint_display()
+            ));
+        }
+
+        // ---- 2) 无键旧规则按型号名认领 ----
+        //
+        // 前提：这条规则现在**认不出**任何在线屏（设备名全对不上）。认得出的不猜。
+        // 歧义保护：在线屏里同名的不止一块、或同名规则不止一条 → 宁可挂起。
+        let mut adoptions: Vec<(usize, String, String)> = Vec::new();
+        for (i, r) in self.rules.iter().enumerate() {
+            if r.monitor_key.is_some() || r.monitor_name.is_empty() {
+                continue;
+            }
+            let matches_live =
+                |m: &Monitor| rule_matches(r, &m.device, m.key.as_deref(), &m.name);
+            if monitors.iter().any(matches_live) {
+                continue;
+            }
+            let same_name: Vec<&Monitor> =
+                monitors.iter().filter(|m| m.name == r.monitor_name).collect();
+            let [m] = same_name.as_slice() else { continue };
+            // 这块屏已有别的规则认领 → 不抢
+            let claimed = self.rules.iter().enumerate().any(|(j, o)| {
+                j != i && rule_matches(o, &m.device, m.key.as_deref(), &m.name)
+            });
+            if claimed {
+                continue;
+            }
+            // 同名规则不止这一条 → 分不清哪条该认
+            if self.rules.iter().filter(|o| o.monitor_name == r.monitor_name).count() > 1 {
+                continue;
+            }
+            adoptions.push((i, m.device.clone(), m.name.clone()));
+        }
+        for (i, device, name) in adoptions {
+            let r = &mut self.rules[i];
+            let old = r.monitor_device.clone();
+            r.monitor_device = device;
+            r.monitor_name = name;
+            let label = r.monitor_display_in(monitors);
+            notes.push(format!(
+                "按型号名「{label}」认回重新接入的显示器（{} → {}），已恢复绑定 → {}",
+                old, r.monitor_device, r.endpoint_display()
+            ));
+        }
+
+        // ---- 3) 给还认得出设备的旧规则补上稳定标识 ----
+        //
+        // 让存量配置升级后也拥有按键重绑的能力。键已被别的规则占用（理论上不该有，
+        // upsert 会按键去重）或当前有歧义时跳过。
+        let taken_keys: HashSet<String> =
+            self.rules.iter().filter_map(|r| r.monitor_key.clone()).collect();
+        for i in 0..self.rules.len() {
+            if self.rules[i].monitor_key.is_some() {
+                continue;
+            }
+            let r = &self.rules[i];
+            let Some(m) = monitors.iter().find(|m| {
+                rule_matches(r, &m.device, m.key.as_deref(), &m.name)
+            }) else {
+                continue;
+            };
+            let Some(k) = m.key.as_ref().filter(|k| live_key_counts.get(k.as_str()) == Some(&1))
+            else {
+                continue;
+            };
+            if taken_keys.contains(k.as_str()) {
+                continue;
+            }
+            let label = r.monitor_display_in(monitors);
+            let endpoint = r.endpoint_display();
+            self.rules[i].monitor_key = Some(k.to_string());
+            notes.push(format!(
+                "已为绑定「{label} → {endpoint}」记录显示器标识 {k}，今后拔插后按此自动恢复"
+            ));
+        }
+
+        // ---- 4) 音频端点换 ID ----
+        let live_ids: HashSet<&str> = endpoints.iter().map(|e| e.id.as_str()).collect();
+        for r in &mut self.rules {
+            if live_ids.contains(r.endpoint_id.as_str()) || r.endpoint_name.is_empty() {
+                continue;
+            }
+            let same_name: Vec<&AudioEndpoint> =
+                endpoints.iter().filter(|e| e.name == r.endpoint_name).collect();
+            let [only] = same_name.as_slice() else { continue };
+            let old = r.endpoint_id.clone();
+            r.endpoint_id = only.id.clone();
+            notes.push(format!(
+                "音频设备「{}」以新的接口 ID 重新出现（{} → {}），已更新绑定「{}」的指向",
+                r.endpoint_name,
+                short_id(&old),
+                short_id(&only.id),
+                r.monitor_display_in(monitors)
+            ));
+        }
+
+        notes
     }
+}
+
+/// 规则与一块在线显示器是否就是"同一块屏"。
+///
+/// 三层判据（见 [`AppConfig::rule_for_monitor`]）：设备名相等、键不冲突、型号名不冲突。
+/// 键或名字任一侧缺失时那一层自动放行——这是旧配置与读不到 EDID 时的兼容路径，
+/// 不是漏洞：缺失意味着没有反面证据，只有设备名一条信息可用。
+fn rule_matches(r: &ScreenRule, device: &str, key: Option<&str>, name: &str) -> bool {
+    r.enabled
+        && r.monitor_device.eq_ignore_ascii_case(device)
+        && keys_compatible(r.monitor_key.as_deref(), key)
+        && names_compatible(&r.monitor_name, name)
+}
+
+/// 规则里的键与在线显示器的键是否指向同一块屏。
+///
+/// 任一侧没有键（旧配置没存 / 这次没读到 EDID）→ 只能信设备名，算兼容；
+/// 两侧都有且不同 → 设备名是别的显示器顶上的，不算。
+fn keys_compatible(rule_key: Option<&str>, live_key: Option<&str>) -> bool {
+    match (rule_key, live_key) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// 规则里的型号名与在线显示器的型号名是否矛盾。
+///
+/// 任一侧为空（规则没存名字 / 这块屏读不到 EDID 型号）→ 算不矛盾；
+/// 两侧都有且不同 → 同一个设备名位置上换了一台别的屏，算矛盾。
+fn names_compatible(rule_name: &str, live_name: &str) -> bool {
+    rule_name.is_empty() || live_name.is_empty() || rule_name == live_name
+}
+
+/// 端点 ID 的日志展示：原始 ID 是 `{0.0.0.00000000}.{guid}` 一长串，截出 guid 的
+/// 头几位够认人了。
+fn short_id(id: &str) -> String {
+    let tail = id.rsplit('.').next().unwrap_or(id);
+    let shown: String = tail.chars().take(8).collect();
+    format!("…{shown}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一条绑定。测试里到处都要，8 行的字面量会把断言淹没。
+    fn rule(
+        monitor_device: &str,
+        monitor_name: &str,
+        key: Option<&str>,
+        endpoint_id: &str,
+        endpoint_name: &str,
+    ) -> ScreenRule {
+        ScreenRule {
+            monitor_device: monitor_device.into(),
+            monitor_name: monitor_name.into(),
+            monitor_key: key.map(str::to_string),
+            endpoint_id: endpoint_id.into(),
+            endpoint_name: endpoint_name.into(),
+            enabled: true,
+        }
+    }
 
     #[test]
     fn default_config_roundtrips() {
@@ -250,25 +550,43 @@ mod tests {
         assert_eq!(cfg.rules.len(), 1);
         assert!(cfg.rules[0].enabled);
         assert_eq!(cfg.rules[0].monitor_name, "");
+        assert_eq!(cfg.rules[0].monitor_key, None, "旧配置没有键，按无键处理");
+    }
+
+    #[test]
+    fn save_replaces_existing_file_and_leaves_no_temp() {
+        // 真实文件系统上的往返：目录里先有一份旧配置，再保存新配置，
+        // 验证顶替成功、读回一致、临时文件无残留（原子写的三条可观察行为）
+        let dir = std::env::temp_dir().join(format!("af-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let mut first = AppConfig::default();
+        first.upsert_rule(rule(r"\\.\DISPLAY1", "A", None, "x", "音箱 A"));
+        AppConfig::save_to(&first, &path).unwrap();
+        assert!(path.exists(), "首次保存应创建文件");
+
+        let mut second = AppConfig::default();
+        second.auto_follow = false;
+        second.upsert_rule(rule(r"\\.\DISPLAY2", "B", Some("edid:b"), "y", "耳机"));
+        AppConfig::save_to(&second, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert!(!back.auto_follow, "保存应顶替旧内容");
+        assert_eq!(back.rules.len(), 1);
+        assert_eq!(back.rules[0].monitor_device, r"\\.\DISPLAY2");
+        assert_eq!(back.rules[0].monitor_key.as_deref(), Some("edid:b"));
+        assert!(!dir.join("config.json.tmp").exists(), "临时文件应被 rename 顶掉");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rule_display_falls_back_to_monitor_number() {
         // 型号取不到（空串）——两块屏都这样时，必须靠设备名推出「显示器 N」来区分
-        let a = ScreenRule {
-            monitor_device: r"\\.\DISPLAY1".into(),
-            monitor_name: String::new(),
-            endpoint_id: "{x}".into(),
-            endpoint_name: "扬声器 A".into(),
-            enabled: true,
-        };
-        let b = ScreenRule {
-            monitor_device: r"\\.\DISPLAY2".into(),
-            monitor_name: String::new(),
-            endpoint_id: "{y}".into(),
-            endpoint_name: "扬声器 B".into(),
-            enabled: true,
-        };
+        let a = rule(r"\\.\DISPLAY1", "", None, "{x}", "扬声器 A");
+        let b = rule(r"\\.\DISPLAY2", "", None, "{y}", "扬声器 B");
         assert_eq!(a.describe(), "显示器 1 → 扬声器 A");
         assert_eq!(b.describe(), "显示器 2 → 扬声器 B");
         assert_ne!(a.describe(), b.describe());
@@ -277,18 +595,13 @@ mod tests {
     #[test]
     fn rule_display_prefers_live_monitor_label() {
         use crate::win::ffi::Rect;
-        let rule = ScreenRule {
-            monitor_device: r"\\.\DISPLAY2".into(),
-            monitor_name: String::new(),
-            endpoint_id: "{x}".into(),
-            endpoint_name: "扬声器".into(),
-            enabled: true,
-        };
+        let rule = rule(r"\\.\DISPLAY2", "", None, "{x}", "扬声器");
         // 实时列表里 DISPLAY2 排在第一位（比如它是主屏）
         let live = vec![
             Monitor {
                 handle: 0,
                 device: r"\\.\DISPLAY2".into(),
+                key: None,
                 name: String::new(),
                 rect: Rect::new(0, 0, 1920, 1080),
                 work: Rect::new(0, 0, 1920, 1080),
@@ -298,6 +611,7 @@ mod tests {
             Monitor {
                 handle: 0,
                 device: r"\\.\DISPLAY1".into(),
+                key: None,
                 name: "MON-A".into(),
                 rect: Rect::new(1920, 0, 4480, 1440),
                 work: Rect::new(1920, 0, 4480, 1440),
@@ -314,21 +628,221 @@ mod tests {
     #[test]
     fn upsert_replaces_same_monitor() {
         let mut cfg = AppConfig::default();
-        cfg.upsert_rule(ScreenRule {
-            monitor_device: r"\\.\DISPLAY1".into(),
-            monitor_name: "A".into(),
-            endpoint_id: "old".into(),
-            endpoint_name: String::new(),
-            enabled: true,
-        });
-        cfg.upsert_rule(ScreenRule {
-            monitor_device: r"\\.\DISPLAY1".into(),
-            monitor_name: "A".into(),
-            endpoint_id: "new".into(),
-            endpoint_name: String::new(),
-            enabled: true,
-        });
+        cfg.upsert_rule(rule(r"\\.\DISPLAY1", "A", None, "old", ""));
+        cfg.upsert_rule(rule(r"\\.\DISPLAY1", "A", None, "new", ""));
         assert_eq!(cfg.rules.len(), 1);
         assert_eq!(cfg.rules[0].endpoint_id, "new");
+    }
+
+    #[test]
+    fn upsert_replaces_by_key_even_under_another_device_name() {
+        // 显示器 X 离线期间没来得及治愈，用户又手动给它（现在的设备名）加了一条。
+        // 旧键的那条必须被顶掉，否则同一块屏有两条规则。
+        let mut cfg = AppConfig::default();
+        cfg.upsert_rule(rule(r"\\.\DISPLAY2", "FHD", Some("edid:0001"), "old", "FHD"));
+        cfg.upsert_rule(rule(r"\\.\DISPLAY3", "FHD", Some("edid:0001"), "new", "FHD"));
+        assert_eq!(cfg.rules.len(), 1, "同键必须顶掉旧规则");
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY3");
+        assert_eq!(cfg.rules[0].endpoint_id, "new");
+    }
+
+    #[test]
+    fn rule_for_monitor_rejects_key_conflict() {
+        // 设备名对上、但键不同 = 这个设备名现在被**另一块**显示器顶上了，不能套用
+        let mut cfg = AppConfig::default();
+        cfg.upsert_rule(rule(r"\\.\DISPLAY1", "H24T7", Some("edid:aaa"), "x", ""));
+        assert!(cfg.rule_for_monitor(r"\\.\DISPLAY1", Some("edid:aaa"), "").is_some());
+        assert!(
+            cfg.rule_for_monitor(r"\\.\DISPLAY1", Some("edid:bbb"), "").is_none(),
+            "键冲突时设备名再像也不能用"
+        );
+        // 型号名冲突同理：同一个位置换了台别的屏
+        assert!(
+            cfg.rule_for_monitor(r"\\.\DISPLAY1", Some("edid:aaa"), "别人的屏").is_none(),
+            "型号名不同说明位置被别的屏顶了"
+        );
+        // 任一侧没有键 / 名字 → 退回设备名匹配（旧配置 / 读不到 EDID 的兼容路径）
+        assert!(cfg.rule_for_monitor(r"\\.\DISPLAY1", None, "").is_some());
+        let mut legacy = AppConfig::default();
+        legacy.upsert_rule(rule(r"\\.\DISPLAY1", "", None, "x", ""));
+        assert!(legacy.rule_for_monitor(r"\\.\DISPLAY1", Some("edid:bbb"), "随便什么屏").is_some());
+    }
+
+    // ------------------------------------------------------------ 记忆治愈 ----
+
+    use crate::win::ffi::Rect;
+
+    fn live_monitor(device: &str, key: Option<&str>, name: &str) -> Monitor {
+        Monitor {
+            handle: 0,
+            device: device.into(),
+            key: key.map(str::to_string),
+            name: name.into(),
+            rect: Rect::new(0, 0, 1920, 1080),
+            work: Rect::new(0, 0, 1920, 1080),
+            is_primary: false,
+            dpi: 96,
+        }
+    }
+
+    fn ep(id: &str, name: &str) -> AudioEndpoint {
+        AudioEndpoint { id: id.into(), name: name.into(), is_default: false }
+    }
+
+    fn cfg_with_rule(monitor_device: &str, key: Option<&str>, endpoint_id: &str) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.upsert_rule(ScreenRule {
+            monitor_device: monitor_device.into(),
+            monitor_name: "FHD".into(),
+            monitor_key: key.map(str::to_string),
+            endpoint_id: endpoint_id.into(),
+            endpoint_name: "FHD".into(),
+            enabled: true,
+        });
+        cfg
+    }
+
+    #[test]
+    fn heal_rebinds_returned_monitor_by_key() {
+        // FHD 屏原来挂在 DISPLAY2，拔掉重插后系统给了 DISPLAY3 —— 键没变，认得出来
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", Some("edid:fhd"), "ep1");
+        let live = vec![
+            live_monitor(r"\\.\DISPLAY1", Some("edid:main"), "H24T7"),
+            live_monitor(r"\\.\DISPLAY3", Some("edid:fhd"), "FHD"),
+        ];
+        let notes = cfg.heal_against(&live, &[ep("ep1", "FHD")]);
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY3", "应重绑到新设备名");
+        assert_eq!(cfg.rules[0].monitor_name, "FHD");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("记忆"), "说明要讲清楚这是记忆恢复：{}", notes[0]);
+        // 治愈是幂等的：再来一遍什么都不改
+        assert!(cfg.heal_against(&live, &[ep("ep1", "FHD")]).is_empty());
+    }
+
+    #[test]
+    fn heal_keeps_rule_for_offline_monitor() {
+        // 绑定的显示器离线：什么都不改（旧版行为是直接删掉，现在靠记忆留着）
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", Some("edid:fhd"), "ep1");
+        let live = vec![live_monitor(r"\\.\DISPLAY1", Some("edid:main"), "H24T7")];
+        let notes = cfg.heal_against(&live, &[ep("ep1", "FHD")]);
+        assert!(notes.is_empty());
+        assert_eq!(cfg.rules.len(), 1, "离线绑定绝不能被删");
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY2");
+    }
+
+    #[test]
+    fn heal_skips_ambiguous_keys() {
+        // 同型号双屏（序列号都是 0）→ 同一个键 → 分不清，不能重绑
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", Some("model:twin"), "ep1");
+        let live = vec![
+            live_monitor(r"\\.\DISPLAY4", Some("model:twin"), "TWIN"),
+            live_monitor(r"\\.\DISPLAY5", Some("model:twin"), "TWIN"),
+        ];
+        assert!(cfg.heal_against(&live, &[ep("ep1", "FHD")]).is_empty());
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY2", "歧义键不能动");
+    }
+
+    #[test]
+    fn heal_rebinds_endpoint_by_unique_name() {
+        // 声卡换了接口：ID 变了，名字没变，且当前只有一个同名端点 → 认得出
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", Some("edid:fhd"), "{old}");
+        let live = vec![live_monitor(r"\\.\DISPLAY2", Some("edid:fhd"), "FHD")];
+        let eps = vec![ep("{new}", "FHD"), ep("{other}", "USB")];
+        let notes = cfg.heal_against(&live, &eps);
+        assert_eq!(cfg.rules[0].endpoint_id, "{new}");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("新的接口 ID"), "说明要写明换 ID 的原因：{}", notes[0]);
+        assert!(cfg.heal_against(&live, &eps).is_empty(), "幂等");
+    }
+
+    #[test]
+    fn heal_leaves_endpoint_alone_when_name_ambiguous_or_id_live() {
+        let live = vec![live_monitor(r"\\.\DISPLAY2", Some("edid:fhd"), "FHD")];
+        // 两个同名端点（两个同型号 USB 声卡）→ 分不清，不动
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", Some("edid:fhd"), "{old}");
+        let ambiguous = vec![ep("{a}", "USB"), ep("{b}", "USB")];
+        assert!(cfg.heal_against(&live, &ambiguous).is_empty());
+        assert_eq!(cfg.rules[0].endpoint_id, "{old}");
+        // 原端点还在线 → 根本不触发换 ID
+        let mut cfg2 = cfg_with_rule(r"\\.\DISPLAY2", Some("edid:fhd"), "{still-live}");
+        let unchanged = vec![ep("{still-live}", "FHD"), ep("{a}", "USB")];
+        assert!(cfg2.heal_against(&live, &unchanged).is_empty());
+        assert_eq!(cfg2.rules[0].endpoint_id, "{still-live}");
+    }
+
+    #[test]
+    fn heal_adopts_keyless_rule_by_unique_name() {
+        // 存量配置（没存过稳定标识）：FHD 屏的绑定还挂在 DISPLAY2 名下，重插后变成
+        // DISPLAY3。键这条路没有，但型号名唯一 → 按名认回，顺手把这枚键也记下来。
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", None, "ep1");
+        let live = vec![
+            live_monitor(r"\\.\DISPLAY1", Some("edid:main"), "H24T7"),
+            live_monitor(r"\\.\DISPLAY3", Some("edid:fhd"), "FHD"),
+        ];
+        let notes = cfg.heal_against(&live, &[ep("ep1", "FHD")]);
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY3", "应按型号名认回");
+        assert_eq!(
+            cfg.rules[0].monitor_key.as_deref(),
+            Some("edid:fhd"),
+            "认回后要补记稳定标识，下次拔插就走键这条路了"
+        );
+        assert!(notes.iter().any(|n| n.contains("认回")), "实际说明：{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("记录显示器标识")));
+        // 之后按键治愈照常工作：再拔插换到 DISPLAY4，靠键认回来
+        let live2 = vec![
+            live_monitor(r"\\.\DISPLAY1", Some("edid:main"), "H24T7"),
+            live_monitor(r"\\.\DISPLAY4", Some("edid:fhd"), "FHD"),
+        ];
+        let notes2 = cfg.heal_against(&live2, &[ep("ep1", "FHD")]);
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY4");
+        assert!(notes2.iter().any(|n| n.contains("记忆")));
+        assert!(cfg.heal_against(&live2, &[ep("ep1", "FHD")]).is_empty(), "幂等");
+    }
+
+    #[test]
+    fn heal_backfills_key_for_online_legacy_rule() {
+        // 存量绑定、显示器一直在线：只补记标识，别的不动
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", None, "ep1");
+        let live = vec![live_monitor(r"\\.\DISPLAY2", Some("edid:fhd"), "FHD")];
+        let notes = cfg.heal_against(&live, &[ep("ep1", "FHD")]);
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY2", "设备名没变就不动");
+        assert_eq!(cfg.rules[0].monitor_key.as_deref(), Some("edid:fhd"));
+        assert_eq!(notes.len(), 1);
+        assert!(cfg.heal_against(&live, &[ep("ep1", "FHD")]).is_empty(), "幂等");
+    }
+
+    #[test]
+    fn heal_does_not_adopt_when_name_unknown_or_ambiguous() {
+        // 型号名对不上任何在线屏（真正的陌生屏）→ 什么都不做
+        let mut cfg = cfg_with_rule(r"\\.\DISPLAY2", None, "ep1");
+        let stranger = vec![live_monitor(r"\\.\DISPLAY3", Some("edid:x"), "OTHER")];
+        assert!(cfg.heal_against(&stranger, &[ep("ep1", "FHD")]).is_empty());
+        assert_eq!(cfg.rules[0].monitor_device, r"\\.\DISPLAY2");
+
+        // 两块在线屏同名（同型号双屏）→ 分不清，不认
+        let twins = vec![
+            live_monitor(r"\\.\DISPLAY4", Some("edid:t1"), "TWIN"),
+            live_monitor(r"\\.\DISPLAY5", Some("edid:t2"), "TWIN"),
+        ];
+        let mut cfg2 = cfg_with_rule(r"\\.\DISPLAY2", None, "ep1");
+        cfg2.rules[0].monitor_name = "TWIN".into();
+        assert!(cfg2.heal_against(&twins, &[ep("ep1", "FHD")]).is_empty());
+        assert_eq!(cfg2.rules[0].monitor_device, r"\\.\DISPLAY2");
+
+        // 两条同名规则 → 也分不清该谁认，都不动
+        // （第二条规则的端点名故意不同，把端点换 ID 的治愈隔离在这个用例之外）
+        let mut cfg3 = cfg_with_rule(r"\\.\DISPLAY2", None, "ep1");
+        cfg3.upsert_rule(ScreenRule {
+            monitor_device: r"\\.\DISPLAY6".into(),
+            monitor_name: "FHD".into(),
+            monitor_key: None,
+            endpoint_id: "ep2".into(),
+            endpoint_name: "USB".into(),
+            enabled: true,
+        });
+        let one_fhd = vec![live_monitor(r"\\.\DISPLAY3", Some("edid:fhd"), "FHD")];
+        assert!(cfg3.heal_against(&one_fhd, &[ep("ep1", "FHD")]).is_empty());
+        assert_eq!(cfg3.rules[0].monitor_device, r"\\.\DISPLAY2");
+        assert_eq!(cfg3.rules[1].monitor_device, r"\\.\DISPLAY6");
     }
 }

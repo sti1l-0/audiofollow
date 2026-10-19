@@ -7,8 +7,20 @@ use super::ffi::{self, Rect, HMONITOR, MONITORINFOEXW, MONITORINFOF_PRIMARY};
 #[derive(Debug, Clone)]
 pub struct Monitor {
     pub handle: HMONITOR,
-    /// 设备名，形如 `\\.\DISPLAY1`。稳定标识，配置里存这个。
+    /// 设备名，形如 `\\.\DISPLAY1`。
+    ///
+    /// 注意它**只在本次连接内稳定**：显示器拔掉重插、或插拔顺序变化后，系统可能给它
+    /// 重新编号（`DISPLAY2` 变 `DISPLAY3`）。跨拔插认出"同一块屏"要靠 [`Monitor::key`]。
     pub device: String,
+    /// 跨拔插稳定的身份标识，形如 `edid:1a2b3c4d5e6f7081`（EDID 身份段哈希），
+    /// **读不到 EDID 时是 `None`**。**记忆功能（拔插后恢复绑定）靠它认人**，见 [`crate::config`]。
+    ///
+    /// 刻意不做"读不到 EDID 就退回硬件型号段"之类的**弱键**：同一块屏会在
+    /// "这次读到了 / 这次没读到"之间摇摆（注册表写入有竞态），弱键和真键是两个
+    /// 不同的字符串，一旦绑定里存了弱键，屏正常报真键的那天起这条绑定就永远
+    /// 匹配不上——比没有键更糟。`None` 会让匹配退回设备名 + 型号名，
+    /// 等 EDID 可读时由补键逻辑（`heal_against`）自愈，不会出现"存了个认不出的键"的死态。
+    pub key: Option<String>,
     /// 型号名，如 `MON-A`。**取不到时为空白**。
     ///
     /// 这里刻意不保留系统给的 `"Generic PnP Monitor"` 这种占位串：两块屏都叫这个名字，
@@ -111,10 +123,12 @@ unsafe extern "system" fn enum_proc(
     let mut info: MONITORINFOEXW = std::mem::zeroed();
     info.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     if ffi::GetMonitorInfoW(hmonitor, &mut info) != 0 {
+        let (name, key) = describe(&info.szDevice);
         out.push(Monitor {
             handle: hmonitor,
             device: ffi::utf16_arr_to_string(&info.szDevice),
-            name: describe(&info.szDevice),
+            key,
+            name,
             rect: info.rcMonitor,
             work: info.rcWork,
             is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
@@ -148,9 +162,9 @@ fn is_placeholder(name: &str) -> bool {
         .any(|n| low.contains(n) || s.contains(n))
 }
 
-/// 取显示器型号名。
+/// 取显示器的型号名与稳定标识。
 ///
-/// 三步走，从最权威到最将就：
+/// 型号名三步走，从最权威到最将就：
 ///
 /// 1. **EDID 里的 `0xFC` 描述符**。这是显示器**自己报上来的**名字（EDID 是显示器固件里的
 ///    一段数据，型号名就在其中），不受驱动影响。本机实测：`MON-A`、`MON-B`。
@@ -162,15 +176,19 @@ fn is_placeholder(name: &str) -> bool {
 ///
 /// 三条都拿不到就返回空串，由调用方退回「显示器 N」。
 ///
+/// 稳定标识（[`Monitor::key`]）只来自 EDID 身份段哈希（见 [`edid_identity`]）；
+/// EDID 读不到就是 `None`，**不做弱键兜底**——理由见 [`Monitor::key`] 的文档：
+/// 弱键会造成"绑定里存了一个屏正常时报不出的键"的死态，`None` 反而能自愈。
+///
 /// > 为什么不用 `SetupDiGetDeviceRegistryProperty(SPDRP_FRIENDLY_NAME)`：它给的是
 /// > `Generic Monitor (MON-A)`，要从括号里抠出来，且需要多一整套 SetupAPI 声明；
 /// > 而 EDID 那条路只需要注册表四个 API，还能顺带拿到厂商码与物理尺寸。
-fn describe(device: &[u16; ffi::CCHDEVICENAME]) -> String {
+fn describe(device: &[u16; ffi::CCHDEVICENAME]) -> (String, Option<String>) {
     unsafe {
         let mut dd: ffi::DISPLAY_DEVICEW = std::mem::zeroed();
         dd.cb = std::mem::size_of::<ffi::DISPLAY_DEVICEW>() as u32;
         if ffi::EnumDisplayDevicesW(device.as_ptr(), 0, &mut dd, 0) == 0 {
-            return String::new();
+            return (String::new(), None);
         }
         let device_string = ffi::utf16_arr_to_string(&dd.DeviceString);
 
@@ -190,27 +208,32 @@ fn describe(device: &[u16; ffi::CCHDEVICENAME]) -> String {
             String::new()
         };
 
+        let edid = edid_from_interface_path(&iface_path);
+
+        // ---- 稳定标识：只认 EDID，读不到就是 None（不做弱键兜底，见 Monitor::key 文档） ----
+        let key = edid.as_deref().and_then(edid_identity);
+
         // ---- 1) EDID 自报的型号名 ----
-        if let Some(edid) = edid_from_interface_path(&iface_path) {
-            if let Some(name) = monitor_name_from_edid(&edid) {
-                return name;
+        if let Some(edid) = edid.as_deref() {
+            if let Some(name) = monitor_name_from_edid(edid) {
+                return (name, key);
             }
         }
 
         // ---- 2) 驱动填的 DeviceString ----
         if !is_placeholder(&device_string) {
-            return device_string;
+            return (device_string, key);
         }
 
         // ---- 3) 接口路径里的硬件型号段 ----
         if let Some(model) = iface_path.split('#').nth(1) {
             if !is_placeholder(model) {
-                return model.to_string();
+                return (model.to_string(), key);
             }
         }
 
         // 实在没有型号。留空，让上层显示「显示器 N」。
-        String::new()
+        (String::new(), key)
     }
 }
 
@@ -364,6 +387,43 @@ pub fn edid_manufacturer(edid: &[u8]) -> Option<String> {
     Some(mfg)
 }
 
+// ------------------------------------------------------------ 稳定标识 --
+
+/// EDID 身份段的字节范围：第 8-17 字节，共 10 字节。
+///
+/// 内容依次是：厂商码(2) + 产品码(2) + 序列号(4) + 生产周(1) + 生产年(1)。
+/// 这一段是显示器**出厂就烧死**的身份——同型号的两台机器序列号也不同（除非固件填 0），
+/// 而且不受显示模式、描述符变化影响。
+///
+/// 刻意**不**哈希整个 EDID 基础块：部分显示器在不同信号格式下会报出不同的
+/// 时序/描述符（4K@60 与 144Hz 模式的 EDID 有差异），整块哈希会把"同一块屏"
+/// 误判成两块。身份段不随模式变。
+const EDID_IDENTITY_RANGE: std::ops::Range<usize> = 8..18;
+
+/// 由 EDID 算出跨拔插稳定的身份标识。
+///
+/// 返回 `edid:<16 位十六进制>`（身份段的 FNV-1a 64 哈希）。EDID 不足 128 字节
+/// （不完整、不该出现在正常机器上）时返回 `None`，由调用方退回名字/设备名匹配。
+///
+/// 为什么不直接存明文"厂商码+产品码+序列号"：这段里序列号是裸数字，日志和
+/// 配置文件里出现一串无意义数字不如短哈希可读；哈希还顺带把比较统一成字符串相等。
+fn edid_identity(edid: &[u8]) -> Option<String> {
+    if edid.len() < 128 {
+        return None;
+    }
+    Some(format!("edid:{:016x}", fnv1a64(&edid[EDID_IDENTITY_RANGE])))
+}
+
+/// FNV-1a 64 位哈希。只为生成稳定短标识，无密码学要求，不引依赖。
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// 读某块显示器当前的 EDID（诊断用，`--selftest` 会打印厂商码）。
 pub fn edid_of(device: &str) -> Option<Vec<u8>> {
     let dev = ffi::wide(device);
@@ -431,6 +491,7 @@ mod tests {
         Monitor {
             handle: 0,
             device: format!(r"\\.\DISPLAY@{left}"),
+            key: None,
             name: String::new(),
             rect: Rect::new(left, top, right, bottom),
             work: Rect::new(left, top, right, bottom),
@@ -634,5 +695,55 @@ mod tests {
         // 全零不是合法厂商码
         assert_eq!(edid_manufacturer(&vec![0u8; 16]), None);
         assert_eq!(edid_manufacturer(&[0u8; 4]), None);
+    }
+
+    // ------------------------------------------------------------ 稳定标识 ----
+
+    /// 身份段不同、其余全同的两份 EDID（模拟同型号、不同序列号的两台机器）。
+    fn edid_with_serial(serial: u32) -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        e[8..18].copy_from_slice(&[0x04, 0x6D, 0x24, 0x28, 0, 0, 0, 0, 1, 30]);
+        e[12..16].copy_from_slice(&serial.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn edid_identity_separates_units_of_same_model() {
+        let a = edid_identity(&edid_with_serial(100)).unwrap();
+        let b = edid_identity(&edid_with_serial(200)).unwrap();
+        assert_ne!(a, b, "同型号不同序列号必须是两个身份");
+        assert!(a.starts_with("edid:"), "实际是 {a}");
+        // 序列号为 0 的两台同型号机器（固件没填）会撞键 —— 上层的歧义保护负责兜住
+        assert_eq!(
+            edid_identity(&edid_with_serial(0)),
+            edid_identity(&edid_with_serial(0))
+        );
+    }
+
+    #[test]
+    fn edid_identity_ignores_non_identity_bytes() {
+        // 时序/描述符区域（模式切换可能变化）不影响身份：
+        // 模拟同一块屏在两种信号格式下报出不同描述符
+        let mut x = edid_with_serial(100);
+        let mut y = x.clone();
+        x[0x36] = 0xAA; // 详细时序槽
+        y[0x48] = 0xBB;
+        assert_eq!(edid_identity(&x), edid_identity(&y));
+        // 身份段一动就不是同一块屏了
+        y[15] ^= 1;
+        assert_ne!(edid_identity(&x), edid_identity(&y));
+    }
+
+    #[test]
+    fn edid_identity_requires_full_base_block() {
+        assert_eq!(edid_identity(&edid_with_serial(1)[..127]), None);
+    }
+
+    #[test]
+    fn fnv1a64_matches_reference_vectors() {
+        // FNV-1a 64 的公开参考向量，防手写常数笔误
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
     }
 }

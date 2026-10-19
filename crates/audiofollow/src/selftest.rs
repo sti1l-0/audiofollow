@@ -64,6 +64,10 @@ pub fn run(write_test: bool, args: &[String]) -> i32 {
     for (i, m) in monitors.iter().enumerate() {
         println!("  {}", m.label(i));
         println!("      设备名     : {}", m.device);
+        println!(
+            "      稳定标识   : {}",
+            m.key.as_deref().unwrap_or("（无——本次未读到 EDID；记忆退回型号名/设备名，读到后会自动补上）")
+        );
         println!("      全景矩形   : {:?}", m.rect);
         println!("      工作区     : {:?}", m.work);
         println!("      DPI        : {} ({}%)", m.dpi, m.scale_percent());

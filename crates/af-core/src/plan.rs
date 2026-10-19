@@ -189,7 +189,10 @@ pub fn build(input: &Inputs) -> Plan {
             continue;
         }
         let Some(mi) = window::monitor_index_for(monitors, w) else { continue };
-        if config.rule_for_monitor(&monitors[mi].device).is_none() {
+        if config
+            .rule_for_monitor(&monitors[mi].device, monitors[mi].key.as_deref(), &monitors[mi].name)
+            .is_none()
+        {
             continue;
         }
         owner_of_window.push((
@@ -257,7 +260,11 @@ pub fn build(input: &Inputs) -> Plan {
         let Some((best_mi, _)) = best else { continue };
 
         let monitor = &monitors[best_mi];
-        let Some(rule) = config.rule_for_monitor(&monitor.device) else { continue };
+        let Some(rule) =
+            config.rule_for_monitor(&monitor.device, monitor.key.as_deref(), &monitor.name)
+        else {
+            continue;
+        };
 
         // 配置里的设备可能已经拔掉了，用当前活跃端点校验一次
         let Some(endpoint) = endpoints.iter().find(|e| e.id == rule.endpoint_id) else {
@@ -290,7 +297,6 @@ pub fn build(input: &Inputs) -> Plan {
         targets.sort_unstable();
         targets.dedup();
 
-        let children = targets.iter().filter(|p| **p != root).count();
         if truncated {
             let note = format!(
                 "「{}」的后代进程超过 {MAX_TARGETS_PER_APP} 个，只接管了前一部分",
@@ -300,7 +306,6 @@ pub fn build(input: &Inputs) -> Plan {
                 plan.notes.push(note);
             }
         }
-        let _ = children;
 
         let (overlap, titles) = by_monitor[&best_mi].clone();
         let contested = by_monitor
@@ -383,6 +388,7 @@ mod tests {
         Monitor {
             handle: 0,
             device: format!(r"\\.\DISPLAY{}", if left == 0 { 1 } else { 2 }),
+            key: None,
             name: name.to_string(),
             rect: Rect::new(left, 0, right, 1080),
             work: Rect::new(left, 0, right, 1080),
@@ -420,6 +426,7 @@ mod tests {
         cfg.upsert_rule(ScreenRule {
             monitor_device: r"\\.\DISPLAY1".into(),
             monitor_name: String::new(),
+            monitor_key: None,
             endpoint_id: "A".into(),
             endpoint_name: "扬声器 A".into(),
             enabled: true,
@@ -427,6 +434,7 @@ mod tests {
         cfg.upsert_rule(ScreenRule {
             monitor_device: r"\\.\DISPLAY2".into(),
             monitor_name: String::new(),
+            monitor_key: None,
             endpoint_id: "B".into(),
             endpoint_name: "扬声器 B".into(),
             enabled: true,
@@ -567,6 +575,7 @@ mod tests {
             // 规则只配了 DISPLAY2，但只有一块 DISPLAY1
             monitor_device: r"\\.\DISPLAY2".into(),
             monitor_name: String::new(),
+            monitor_key: None,
             endpoint_id: "A".into(),
             endpoint_name: "扬声器 A".into(),
             enabled: true,
@@ -585,6 +594,35 @@ mod tests {
     }
 
     #[test]
+    fn key_conflict_blocks_stale_device_name() {
+        // 拔插后系统重新编号：X 屏的规则还挂在 DISPLAY1 名下，但现在占着 DISPLAY1 的
+        // 是 Z 屏（键不同）。治愈机制会重绑，但**治愈之前**（周期扫描还没轮到），
+        // 计划绝不能把 X 的规则套到 Z 头上。
+        let mut m = mon(0, 1920, "");
+        m.key = Some("edid:z".into());
+        let endpoints = vec![ep("A", "扬声器 A")];
+        let mut cfg = AppConfig::default();
+        cfg.upsert_rule(ScreenRule {
+            monitor_device: r"\\.\DISPLAY1".into(),
+            monitor_name: String::new(),
+            monitor_key: Some("edid:x".into()),
+            endpoint_id: "A".into(),
+            endpoint_name: "扬声器 A".into(),
+            enabled: true,
+        });
+        let p = build(&Inputs {
+            config: &cfg,
+            monitors: &[m],
+            windows: &[win(200, "chrome.exe", 100, 900)],
+            endpoints: &endpoints,
+            tree: &browser_tree(),
+            sessions: &[],
+            self_pid: 9999,
+        });
+        assert!(p.is_empty(), "键冲突时不能套用旧设备名下的规则");
+    }
+
+    #[test]
     fn offline_endpoint_is_reported_not_silently_dropped() {
         // 规则指向的声卡被拔了：必须出说明，不能静默什么都不做
         let monitors = vec![mon(0, 1920, "")];
@@ -593,6 +631,7 @@ mod tests {
         cfg.upsert_rule(ScreenRule {
             monitor_device: r"\\.\DISPLAY1".into(),
             monitor_name: String::new(),
+            monitor_key: None,
             endpoint_id: "B-已拔掉".into(),
             endpoint_name: "蓝牙耳机".into(),
             enabled: true,

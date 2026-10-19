@@ -63,6 +63,10 @@ struct PropVariant {
     data: [u8; 16],
 }
 
+// Win32 PROPVARIANT：8 字节头（vt + 三个保留字）+ 16 字节联合体载荷 = 24，对齐 8。
+// `IPropertyStore::GetValue` 按这个布局写，读端点友好名全靠它。
+const _: () = assert!(std::mem::size_of::<PropVariant>() == 24);
+
 impl PropVariant {
     fn zeroed() -> Self {
         Self { vt: 0, _r1: 0, _r2: 0, _r3: 0, data: [0; 16] }
@@ -87,6 +91,9 @@ struct PropertyKey {
     fmtid: Guid,
     pid: u32,
 }
+
+// PROPERTYKEY = GUID(16) + DWORD(4) = 20。键值错位会把不相干的属性读进来。
+const _: () = assert!(std::mem::size_of::<PropertyKey>() == 20);
 
 /// `PKEY_Device_FriendlyName`
 const PKEY_DEVICE_FRIENDLY_NAME: PropertyKey = PropertyKey {

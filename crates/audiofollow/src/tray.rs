@@ -14,7 +14,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, Predefin
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// 托盘上发生的事。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayEvent {
     OpenSettings,
     /// 用户点了「自动跟随」。**不带目标状态**：菜单勾选框的状态由托盘线程维护，
@@ -22,6 +22,13 @@ pub enum TrayEvent {
     ToggleAutoFollow,
     Reapply,
     Quit,
+    /// 托盘不可用（图标生成或注册失败）。载荷是原因。
+    ///
+    /// 这件事很严重：**「退出并还原」只存在于托盘菜单里**，托盘没了就意味着
+    /// 程序失去了唯一的优雅退出入口。主线程收到后会把设置窗口顶出来，并把
+    /// 「关窗」改成「还原并退出」，免得用户只能用任务管理器杀进程——那会跳过还原，
+    /// 改过的路由就留在系统里了。
+    TrayFailed(String),
 }
 
 /// 主线程 → 托盘线程的指令。
@@ -107,8 +114,11 @@ pub fn spawn(on_event: impl Fn(TrayEvent) + Send + Sync + 'static) -> TrayHandle
             //
             // 回调在窗口过程里同步执行，所以这里只允许做转发（`on_event` 内部就是
             // 往 channel 里塞一个枚举），不能碰主线程的状态。
+            //
+            // on_event 包 Arc：handler 闭包和下面的失败分支都要调用它。
+            let on_event = std::sync::Arc::new(on_event);
             {
-                let on_event = on_event;
+                let on_event = on_event.clone();
                 let ids = ids.clone();
                 MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
                     if ev.id == ids.open {
@@ -126,7 +136,10 @@ pub fn spawn(on_event: impl Fn(TrayEvent) + Send + Sync + 'static) -> TrayHandle
             let icon = match tray_icon() {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("[托盘] 生成图标失败：{e}");
+                    // 只 eprintln 没用：本进程是 GUI 子系统，stderr 没人看。
+                    // 必须把失败送回主线程——托盘没了，「退出并还原」就没了，
+                    // 主线程要据此改变关窗行为（见 ui.rs 的 TrayFailed 处理）。
+                    on_event(TrayEvent::TrayFailed(format!("生成托盘图标失败：{e}")));
                     return;
                 }
             };
@@ -139,7 +152,9 @@ pub fn spawn(on_event: impl Fn(TrayEvent) + Send + Sync + 'static) -> TrayHandle
                 .build()
             {
                 Ok(tray) => run_loop(event_loop, auto, tray),
-                Err(e) => eprintln!("[托盘] 注册失败：{e}"),
+                Err(e) => {
+                    on_event(TrayEvent::TrayFailed(format!("注册托盘图标失败：{e}")));
+                }
             }
         })
         .expect("无法创建托盘线程");

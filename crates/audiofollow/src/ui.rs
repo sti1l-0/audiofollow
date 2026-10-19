@@ -6,13 +6,21 @@
 //! - **事件钩子线程**：`SetWinEventHook` 的消息循环，回调只累加一个原子计数。
 //!   见 [`af_core::win::hook`] 关于"为什么必须单独一条线程"的说明。
 //!
-//! # 触发同步的三条路径
+//! # 触发同步的四条路径
 //!
 //! 1. **窗口事件**（主路径）：钩子线程收到事件 → 置脏 → 主线程 100 ms 醒来时发现脏了，
 //!    等手停下来（去抖 250 ms，上限 1 s）再同步。拖动窗口后大约 250 ms 内声音就换了设备。
 //! 2. **托盘菜单**"立即重新应用"。
 //! 3. **兜底轮询**：事件覆盖不到的情况 —— 进程重启、路由被别的程序改掉、
 //!    某个应用刚出声。周期见 [`FALLBACK_POLL_MS`]。
+//! 4. **设备扫描**：显示器拔插、声卡进出（周期 [`DEVICE_SCAN_MS`]）。扫到设备集变化
+//!    或记忆治愈修好了绑定，就强制下一轮同步立刻执行。
+//!
+//! # 设备记忆
+//!
+//! 绑定**从不因设备离线而删除**。显示器拔掉重插后系统可能重新编号（`DISPLAY2` →
+//! `DISPLAY3`），声卡换接口后端点 ID 会变——每轮设备扫描都会按稳定标识把这类绑定
+//! "治愈"回可用状态（见 [`af_core::config::AppConfig::heal_against`]），用户无感。
 //!
 //! 关掉事件驱动（配置或界面）就退化成纯轮询，行为与早期版本一致。
 
@@ -57,6 +65,13 @@ const MAX_DEBOUNCE_MS: u64 = 1000;
 /// 事件能覆盖"用户摆窗口"，覆盖不了"应用自己重启后路由丢了"或"某个应用刚开始出声"。
 /// 这个周期就是给那几种情况收口的。
 const FALLBACK_POLL_MS: u64 = 4000;
+/// 设备自动扫描的周期（显示器拔插、声卡进出）。
+///
+/// Windows 的显示器与音频设备变化没有走 `SetWinEventHook` 的通知，这里用轮询盯。
+/// 枚举本身很便宜（`EnumDisplayMonitors` + 少量注册表/COM 读取），几秒一次无感。
+/// 显示器重新接入后，它挂的 HDMI 音频端点可能晚几秒才出现——这个周期顺带把
+/// "屏回来了但声音设备还没回来"的窗口期也收掉了。
+const DEVICE_SCAN_MS: u64 = 4000;
 
 /// 一批待处理的窗口事件。
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +101,12 @@ struct AppState {
     /// **真相源在注册表里**（用户可以绕过我们从任务管理器里禁用它），
     /// 这个字段只是启动时读一次的缓存，给界面用。
     startup: bool,
+    /// 托盘图标是否还活着。
+    ///
+    /// 托盘注册失败时（见 `tray::TrayEvent::TrayFailed`）置 false：那时「退出并还原」
+    /// 的唯一入口没了，关窗的含义要从「藏进托盘」改成「还原并退出」，否则用户只能
+    /// 用任务管理器杀进程——那会跳过还原，把改过的路由留在系统里。
+    tray_alive: bool,
     /// 不直接用，靠 Drop 保证托盘句柄活着。
     _tray: tray::TrayHandle,
 
@@ -96,6 +117,14 @@ struct AppState {
     dirty: Option<Dirty>,
     /// 累计处理过的事件数，只用于展示。
     events_total: usize,
+
+    // ---- 设备自动扫描 ----
+    /// 上次设备扫描的时刻。
+    last_device_scan: Instant,
+    /// 上次音频端点枚举是否成功。
+    ///
+    /// 只在**状态翻转**时记日志：音频服务偶尔抖一下不该每 4 秒刷一行"枚举失败"。
+    endpoints_ok: bool,
 
     // ---- 计划里的说明，用来在变化时提示一次 ----
     plan_notes: Vec<String>,
@@ -127,10 +156,13 @@ impl AppState {
             last_sync: Instant::now() - Duration::from_secs(3600),
             quitting: false,
             startup: false,
+            tray_alive: true,
             _tray: tray_handle,
             hook: None,
             dirty: None,
             events_total: 0,
+            last_device_scan: Instant::now(),
+            endpoints_ok: true,
             plan_notes: Vec::new(),
             logged_notes: Vec::new(),
             last_action: HashMap::new(),
@@ -260,19 +292,32 @@ impl AppState {
 
     // ---------------------------------------------------------- 设备扫描 ----
 
+    /// 启动 / 手动「重新扫描」：完整列出设备清单，再做记忆治愈。
     fn rescan(&mut self) {
-        self.monitors = win::monitor::enumerate();
-        self.log(format!("检测到 {} 块显示器", self.monitors.len()));
-        let labels: Vec<String> = self
-            .monitors
-            .iter()
-            .enumerate()
-            .map(|(i, m)| m.label(i))
-            .collect();
-        for l in labels {
-            self.log(format!("  {l}"));
-        }
+        self.refresh_devices(true);
+    }
 
+    /// 周期性的设备自动扫描。到了 [`DEVICE_SCAN_MS`] 的节奏就扫一遍。
+    fn maybe_refresh_devices(&mut self) {
+        if self.last_device_scan.elapsed() < Duration::from_millis(DEVICE_SCAN_MS) {
+            return;
+        }
+        self.last_device_scan = Instant::now();
+        self.refresh_devices(false);
+    }
+
+    /// 扫一遍显示器与音频设备，与上一轮比对，然后做**记忆治愈**。
+    ///
+    /// 这是「设备记忆」的入口。显示器拔掉重插后系统可能给它换设备名（`DISPLAY2`
+    /// 变 `DISPLAY3`）、声卡换接口后端点 ID 会变——两者都会让绑定"看起来失效"。
+    /// [`AppConfig::heal_against`] 按稳定标识（EDID 身份哈希 / 设备名）把它们认回来，
+    /// 修好后立刻强制一轮同步，用户不用做任何事。
+    ///
+    /// `verbose` 为真时完整列出当前设备（启动与手动扫描用）；周期扫描只报变化，
+    /// 否则每 4 秒刷一遍设备清单。
+    fn refresh_devices(&mut self, verbose: bool) {
+        // 音频接口迟到自愈：开机时音频服务可能比本程序晚起来，第一次 init 失败
+        // 不代表永远失败，每次扫描都再试。只在成功那一刻记日志。
         if self.env.is_none() {
             match AudioEnv::init_in(self.apartment) {
                 Ok(env) => {
@@ -285,50 +330,111 @@ impl AppState {
                     self.env_error = None;
                 }
                 Err(e) => {
-                    let msg = format!("音频接口初始化失败：{e}");
-                    self.env_error = Some(msg.clone());
-                    self.log(msg);
-                }
-            }
-        }
-
-        if let Some(env) = self.env.as_ref() {
-            match env.endpoints() {
-                Ok(eps) => {
-                    self.log(format!("检测到 {} 个音频输出设备", eps.len()));
-                    for (i, ep) in eps.iter().enumerate() {
-                        self.log(format!("  {}", ep.label(i)));
+                    // 失败只在 verbose（启动/手动）或"上次还是好的"翻转时说一次，
+                    // 不然音频服务晚起的几分钟里每 4 秒刷一行一样的错
+                    if verbose || self.endpoints_ok {
+                        self.log(format!("音频接口初始化失败：{e}"));
                     }
-                    self.endpoints = eps;
+                    self.endpoints_ok = false;
+                    self.env_error = Some(format!("音频接口初始化失败：{e}"));
                 }
-                Err(e) => self.log(format!("枚举音频设备失败：{e}")),
             }
         }
 
-        self.prune_rules();
-    }
+        let monitors = win::monitor::enumerate();
+        let endpoints = match self.env.as_ref().map(|e| e.endpoints()) {
+            Some(Ok(eps)) => {
+                if !verbose && !self.endpoints_ok {
+                    self.log("音频设备枚举已恢复");
+                }
+                self.endpoints_ok = true;
+                eps
+            }
+            Some(Err(e)) => {
+                if verbose || self.endpoints_ok {
+                    self.log(format!("枚举音频设备失败：{e}"));
+                }
+                self.endpoints_ok = false;
+                return; // 端点列表不可信，本轮不更新、不治愈
+            }
+            None => Vec::new(),
+        };
 
-    /// 清掉指向已不存在设备的绑定。
-    ///
-    /// **必须加保护**：音频设备枚举可能因为服务未启动、接口初始化失败而瞬时返回空列表，
-    /// 那种情况下按"设备不见了"去删绑定，会把用户配置一次性清光。所以只在
-    /// "确实扫到了设备"时才清理。
-    fn prune_rules(&mut self) {
-        if self.monitors.is_empty() || self.endpoints.is_empty() {
-            return;
+        // ---- 与上一轮比对 ----
+        //
+        // 比对集合借着 self.monitors/self.endpoints，而打日志要 &mut self，
+        // 所以先把要说的攒进局部 Vec，出了这个块再打。
+        let (changed, diff_logs) = {
+            let old_mon: HashSet<&str> = self.monitors.iter().map(|m| m.device.as_str()).collect();
+            let new_mon: HashSet<&str> = monitors.iter().map(|m| m.device.as_str()).collect();
+            let old_ep: HashSet<&str> = self.endpoints.iter().map(|e| e.id.as_str()).collect();
+            let new_ep: HashSet<&str> = endpoints.iter().map(|e| e.id.as_str()).collect();
+
+            let mut logs: Vec<String> = Vec::new();
+            // 新增的设备：verbose 模式下面的清单会完整列出，逐条报"已连接"就重复了
+            if !verbose {
+                for m in &monitors {
+                    if !old_mon.contains(m.device.as_str()) {
+                        logs.push(format!(
+                            "显示器已连接：{}",
+                            win::monitor::name_from_device(&m.device)
+                        ));
+                    }
+                }
+                for e in &endpoints {
+                    if !old_ep.contains(e.id.as_str()) {
+                        logs.push(format!("音频设备已出现：{}", e.name));
+                    }
+                }
+            }
+            // 消失的设备两种模式都要报：清单里看不到"少了什么"
+            for m in &self.monitors {
+                if !new_mon.contains(m.device.as_str()) {
+                    logs.push(format!(
+                        "显示器已断开：{}（绑定保留，重新接入后自动恢复）",
+                        win::monitor::name_from_device(&m.device)
+                    ));
+                }
+            }
+            for e in &self.endpoints {
+                if !new_ep.contains(e.id.as_str()) {
+                    logs.push(format!("音频设备已移除：{}", e.name));
+                }
+            }
+            (old_mon != new_mon || old_ep != new_ep, logs)
+        };
+        for l in diff_logs {
+            self.log(l);
         }
-        let mdevs: Vec<&str> = self.monitors.iter().map(|m| m.device.as_str()).collect();
-        let eids: Vec<&str> = self.endpoints.iter().map(|e| e.id.as_str()).collect();
-        let dropped = self.config.prune_missing(&mdevs, &eids);
-        if !dropped.is_empty() {
-            self.log(format!(
-                "已移除 {} 条失效绑定：{}",
-                dropped.len(),
-                dropped.join("；")
-            ));
+
+        if verbose {
+            self.log(format!("检测到 {} 块显示器", monitors.len()));
+            for (i, m) in monitors.iter().enumerate() {
+                self.log(format!("  {}", m.label(i)));
+            }
+            self.log(format!("检测到 {} 个音频输出设备", endpoints.len()));
+            for (i, ep) in endpoints.iter().enumerate() {
+                self.log(format!("  {}", ep.label(i)));
+            }
+        }
+
+        self.monitors = monitors;
+        self.endpoints = endpoints;
+
+        // ---- 记忆治愈：换编号的显示器、换 ID 的声卡，在这里认回来 ----
+        let notes = self.config.heal_against(&self.monitors, &self.endpoints);
+        for n in &notes {
+            self.log(n);
+        }
+        if !notes.is_empty() {
             if let Err(e) = self.config.save() {
                 self.log(format!("保存配置失败：{e}"));
             }
+        }
+
+        if changed || !notes.is_empty() {
+            // 设备集变了或绑定恢复了：下一轮同步不等轮询周期，立刻执行
+            self.last_sync = Instant::now() - Duration::from_secs(3600);
         }
     }
 
@@ -400,7 +506,13 @@ impl AppState {
         let Some(ep) = self.endpoints.get(endpoint_index) else {
             return "没有可用的音频设备".into();
         };
-        let rule = ScreenRule::from_pair(&m.device, &m.name, ep);
+        // 把显示器的稳定标识记进规则：拔插后设备名会变，靠它才能认出"同一块屏"。
+        // 同型号双屏会共用一个标识（EDID 序列号都是 0），这种标识写进去反而会
+        // 引起误认——留空，退回设备名匹配（与旧版行为一致）。
+        let key = m.key.as_deref().filter(|k| {
+            self.monitors.iter().filter(|o| o.key.as_deref() == Some(*k)).count() == 1
+        });
+        let rule = ScreenRule::from_pair(&m.device, &m.name, key, ep);
         let desc = rule.describe();
         self.config.upsert_rule(rule);
         match self.config.save() {
@@ -583,6 +695,17 @@ impl AppState {
                 // 我们还在定时器回调里，只要它没被处理就退不掉。
                 self._tray.request_quit();
             }
+            TrayEvent::TrayFailed(reason) => {
+                self.tray_alive = false;
+                self.log(format!("托盘不可用：{reason}"));
+                self.log(
+                    "退出方式已切换：关闭设置窗口 = 先还原全部路由再退出。\
+                     也可以先点「还原全部改动」核对一遍再关窗",
+                );
+                // 窗口必须顶出来：托盘菜单没了，这里可能是用户接触本程序的唯一入口
+                // （开机自动启动那条路原本不弹窗）。
+                let _ = ui.show();
+            }
         }
     }
 
@@ -614,6 +737,23 @@ impl AppState {
         )
     }
 
+    /// 模型内容变化后，把下拉框的选中项按**标签**重新定位。
+    ///
+    /// slint 的 `current-index` 是纯位置：列表一变（设备插入/移除/重排），原来的
+    /// 序号会指向**另一个条目**——用户以为还选着「屏幕 1」，实际已经换人了，再点
+    /// 「添加绑定」就会绑到错的设备上。按值找回来：标签还在就跟随；不在了
+    /// （选中的设备被拔掉、或标签变了）就清空选择，让占位文案提示用户重选。
+    /// 诚实地丢选择，也好过沉默地换目标。
+    fn carry_selection(old: &[String], old_index: i32, new: &[String]) -> i32 {
+        if old_index < 0 {
+            return -1;
+        }
+        match old.get(old_index as usize) {
+            Some(label) => new.iter().position(|l| l == label).map_or(-1, |i| i as i32),
+            None => -1,
+        }
+    }
+
     fn sync_to_ui(&mut self, ui: &AppWindow) {
         // slint 的 `[string]` 对应 SharedString，不是 String，这里统一转一次
         let to_model = |lines: Vec<String>| -> slint::ModelRc<slint::SharedString> {
@@ -628,8 +768,10 @@ impl AppState {
             .map(|(i, m)| m.label(i))
             .collect();
         if ml != self.pushed_monitors {
+            let kept = Self::carry_selection(&self.pushed_monitors, ui.get_monitor_index(), &ml);
             self.pushed_monitors = ml.clone();
             ui.set_monitor_lines(to_model(ml));
+            ui.set_monitor_index(kept);
         }
 
         let el: Vec<String> = self
@@ -639,30 +781,38 @@ impl AppState {
             .map(|(i, e)| e.label(i))
             .collect();
         if el != self.pushed_endpoints {
+            let kept = Self::carry_selection(&self.pushed_endpoints, ui.get_endpoint_index(), &el);
             self.pushed_endpoints = el.clone();
             ui.set_endpoint_lines(to_model(el));
+            ui.set_endpoint_index(kept);
         }
 
         // 绑定行按**当前实际扫到的显示器**解析展示名，这样「显示器 N」的编号
         // 和上面的下拉框始终一致。屏幕不在线时如实标注，而不是悄悄消失。
+        // 设备名虽然对上、但键或型号名对不上（位置被别的显示器顶了）也要说清楚，
+        // 不然用户会以为绑定还生效着。
         let rows: Vec<RuleRow> = self
             .config
             .rules
             .iter()
             .map(|r| {
-                let monitor = self
+                let at_slot = self
                     .monitors
                     .iter()
                     .enumerate()
-                    .find(|(_, m)| m.device == r.monitor_device)
+                    .find(|(_, m)| m.device.eq_ignore_ascii_case(&r.monitor_device));
+                let monitor = match at_slot {
                     // label(i) 是完整信息（编号 · 分辨率 · 主屏标记），和下拉框一致
-                    .map(|(i, m)| m.label(i))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{}（不在线）",
-                            win::monitor::name_from_device(&r.monitor_device)
-                        )
-                    });
+                    Some((i, m)) if r.matches_monitor(m) => m.label(i),
+                    Some((_, _)) => format!(
+                        "{}（该位置现在是别的显示器，等待原屏接入后自动恢复）",
+                        win::monitor::name_from_device(&r.monitor_device)
+                    ),
+                    None => format!(
+                        "{}（不在线，接入后自动恢复）",
+                        win::monitor::name_from_device(&r.monitor_device)
+                    ),
+                };
                 let endpoint = if r.endpoint_name.is_empty() {
                     r.endpoint_id.clone()
                 } else {
@@ -840,13 +990,25 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
     // slint 的默认动作**本来就**是隐藏（`CloseRequestResponse::HideWindow` 是默认值），
     // 坑在事件循环上 —— 见下面 `run_event_loop_until_quit` 那段。这里只留一句话，
     // 免得用户以为程序已经退了。
+    //
+    // 例外：托盘不可用时（`tray::TrayEvent::TrayFailed`）关窗 = 还原并退出。
+    // 「退出并还原」只在托盘菜单里，托盘没了再藏窗口，程序就成了一个只能靠
+    // 任务管理器杀掉的僵尸——那会跳过还原。所以这里直接在主线程上还原完路由，
+    // 然后 exit(0)。不走 slint 的退出信号（异步，在回调里叫不醒循环），
+    // 也不走托盘线程（它已经死了）；还原是 `shutdown()` 里同步做完的，
+    // exit 前没有未落地的副作用。
     {
         let st = state.clone();
         ui.window().on_close_requested(move || {
             if let Ok(mut s) = st.try_borrow_mut() {
-                s.note_window_hidden();
+                if s.tray_alive {
+                    s.note_window_hidden();
+                    return slint::CloseRequestResponse::HideWindow;
+                }
+                println!("---- 托盘不可用，关窗即退出：先还原 ----");
+                s.shutdown();
             }
-            slint::CloseRequestResponse::HideWindow
+            std::process::exit(0);
         });
     }
 
@@ -872,6 +1034,9 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
                     // 这时候再去 pump/maybe_sync 会把刚还回去的路由又改一遍。
                     return;
                 }
+                // 设备扫描放在最前面：拔插显示器 / 声卡回来的那一刻，先让记忆治愈
+                // 修好绑定，紧接着的 maybe_sync 就能按新状态路由，不用等下一轮
+                s.maybe_refresh_devices();
                 s.pump_events();
                 s.maybe_sync();
                 s.sync_to_ui(&ui);
