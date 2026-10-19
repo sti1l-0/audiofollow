@@ -66,6 +66,21 @@ component Switch inherits Rectangle {
         animate x { duration: 150ms; easing: ease-out; }
     }
 
+    // 键盘可达：Tab 聚焦后 Enter/空格等效点击。FocusScope 不拦截鼠标事件，
+    // 放在 TouchArea 下面一层，纯键盘用途。
+    FocusScope {
+        width: parent.width;
+        height: parent.height;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                parent.checked = !parent.checked;
+                parent.toggled(parent.checked);
+                return accept;
+            }
+            reject
+        }
+    }
+
     TouchArea {
         clicked => {
             parent.checked = !parent.checked;
@@ -88,9 +103,24 @@ component AppButton inherits Rectangle {
     background: !self.enabled ? #dee3ec
         : ta.has-hover ? (danger ? #bb2847 : primary ? Theme.accent-hover : #eef2f8)
         : (danger ? Theme.danger : primary ? Theme.accent : Theme.card);
-    border-width: primary || danger || !self.enabled ? 0 : 1px;
-    border-color: Theme.border;
+    // 焦点环：键盘用户必须能看到焦点在哪（FocusScope 在下面的 fs）
+    border-width: fs.has-focus ? 2px : (primary || danger || !self.enabled ? 0 : 1px);
+    border-color: fs.has-focus ? Theme.accent : Theme.border;
     animate background { duration: 110ms; }
+
+    // 键盘可达：Tab 聚焦后 Enter/空格触发 clicked。不拦截鼠标事件。
+    fs := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
 
     ta := TouchArea {
         enabled: root.enabled;
@@ -119,8 +149,38 @@ component Dropdown inherits Rectangle {
     border-radius: 8px;
     background: Theme.card;
     border-width: 1px;
-    border-color: ta.has-hover ? #c3cfe1 : Theme.border;
+    border-color: fs.has-focus ? Theme.accent : ta.has-hover ? #c3cfe1 : Theme.border;
     animate border-color { duration: 110ms; }
+
+    // 键盘可达：Tab 聚焦后 Enter/空格弹开列表，↑/↓ 直接换选中项（不必弹开），
+    // Esc 关闭弹层。FocusScope 不拦截鼠标事件。
+    fs := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                list-popup.show();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                list-popup.close();
+                return accept;
+            }
+            if (event.text == Key.DownArrow || event.text == Key.UpArrow) {
+                if (root.model.length > 0) {
+                    if (root.current-index < 0) {
+                        root.current-index = 0;
+                    } else {
+                        root.current-index = Math.max(0, Math.min(root.model.length - 1,
+                            root.current-index + (event.text == Key.DownArrow ? 1 : -1)));
+                    }
+                    root.select(root.current-index);
+                }
+                return accept;
+            }
+            reject
+        }
+    }
 
     ta := TouchArea {
         mouse-cursor: pointer;
@@ -224,10 +284,17 @@ export component AppWindow inherits Window {
     in-out property <bool> hook-live: false;
     in-out property <bool> startup: false;
     in-out property <string> headline: "正在初始化…";
+    // 日志区展开状态。展开时占窗口一半高，收起时固定 170px。
+    in-out property <bool> log-expanded: false;
+    // 「添加绑定」附近的内联提示（失败原因就地显示，而不是只沉到下面日志区里）。
+    // 空串 = 无提示。
+    in-out property <string> add-hint: "";
 
     // ---- Rust 侧挂接的动作 ----
     callback add-rule();
     callback remove-rule(int);
+    callback toggle-rule(int);
+    callback auto-match();
     callback rescan();
     callback apply-now();
     callback toggle-auto-follow(bool);
@@ -338,6 +405,13 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
+                    // 按型号名自动配对：HDMI/DP 音频的端点名里通常就含显示器型号
+                    //（如「H24T7 (NVIDIA High Definition Audio)」），点一下就能把
+                    // 还没绑定的屏配到自己的音箱上，省去逐个选下拉框。
+                    AppButton {
+                        text: "一键匹配";
+                        clicked => { root.auto-match(); }
+                    }
                     Text {
                         text: root.rules.length + " 条绑定";
                         font-size: 12px;
@@ -373,6 +447,14 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                // 添加失败的内联提示：原因就地显示。只沉到下面日志区的话，
+                // 用户的注意力在按钮上，看不见。
+                if root.add-hint != "" : Text {
+                    text: root.add-hint;
+                    font-size: 12px;
+                    color: Theme.danger;
+                }
+
                 // 列表(空时显示引导文案)
                 Rectangle {
                     vertical-stretch: 1;
@@ -389,7 +471,7 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                         }
                         Text {
-                            text: "从上方选一块屏幕和一台音频设备，点「添加绑定」。\n之后窗口拖到那块屏，它的声音就会切到对应设备。";
+                            text: "点「一键匹配」按型号名自动配对；或从上方选一块屏幕和一台音频设备。\n之后窗口拖到那块屏，它的声音就会切到对应设备。";
                             font-size: 12px;
                             color: Theme.text-3;
                             horizontal-alignment: center;
@@ -397,11 +479,23 @@ export component AppWindow inherits Window {
                     }
 
                     if root.rules.length > 0 : ListView {
-                        for r[index] in root.rules : Rectangle {
+                        for r[index] in root.rules : row := Rectangle {
+                            // 删除的两段式确认：第一次点 ✕ 只是点亮确认态（红色实底），
+                            // 3 秒内再点才真删。绑定现在承载着"设备回来自动恢复"的
+                            // 记忆价值，误删的代价比以前高。模型重推（规则变化）会
+                            // 重建行，确认态随之复位——安全方向的失效，可接受。
+                            property <bool> armed: false;
                             height: 46px;
                             border-radius: 7px;
                             background: row-hover.has-hover ? Theme.hover-row : transparent;
                             animate background { duration: 100ms; }
+
+                            // 确认态 3 秒超时：点了 ✕ 却没有下文，自动熄灭
+                            Timer {
+                                interval: 3s;
+                                running: row.armed;
+                                triggered => { row.armed = false; }
+                            }
 
                             row-hover := TouchArea { mouse-cursor: default; }
 
@@ -443,13 +537,33 @@ export component AppWindow inherits Window {
                                     Rectangle { vertical-stretch: 1; }
                                 }
 
-                                // 行内删除:hover 变红底。
+                                if row.armed : Text {
+                                    text: "再点一次删除";
+                                    font-size: 11px;
+                                    color: Theme.danger;
+                                    vertical-alignment: center;
+                                }
+
+                                // 行内停用开关：不删绑定，只是让这块屏暂时不参与
+                                // 改道（那块屏上的应用恢复原路由）
+                                Switch {
+                                    checked: r.enabled;
+                                    toggled(on) => { root.toggle-rule(index); }
+                                }
+
+                                // 行内删除:hover 变红底,armed 变红底白叉。
                                 // "✕" 字符缺字形(渲染成豆腐块),用 Path 画两条线。
                                 Rectangle {
                                     width: 28px;
                                     del-ta := TouchArea {
                                         mouse-cursor: pointer;
-                                        clicked => { root.remove-rule(index); }
+                                        clicked => {
+                                            if (row.armed) {
+                                                root.remove-rule(index);
+                                            } else {
+                                                row.armed = true;
+                                            }
+                                        }
                                     }
                                     Rectangle {
                                         width: 22px;
@@ -457,7 +571,8 @@ export component AppWindow inherits Window {
                                         x: (parent.width - self.width) / 2;
                                         y: (parent.height - self.height) / 2;
                                         border-radius: 6px;
-                                        background: del-ta.has-hover ? Theme.danger-soft : transparent;
+                                        background: row.armed ? Theme.danger
+                                            : del-ta.has-hover ? Theme.danger-soft : transparent;
                                         animate background { duration: 100ms; }
                                         Path {
                                             width: 10px;
@@ -467,7 +582,8 @@ export component AppWindow inherits Window {
                                             viewbox-width: 10;
                                             viewbox-height: 10;
                                             commands: "M 1.5 1.5 L 8.5 8.5 M 8.5 1.5 L 1.5 8.5";
-                                            stroke: del-ta.has-hover ? Theme.danger : Theme.text-3;
+                                            stroke: row.armed ? white
+                                                : del-ta.has-hover ? Theme.danger : Theme.text-3;
                                             stroke-width: 1.4px;
                                             stroke-line-cap: round;
                                         }
@@ -482,7 +598,13 @@ export component AppWindow inherits Window {
 
         // ================= 日志卡片(深色终端风) =================
         Rectangle {
-            height: 170px;
+            // 展开时与绑定卡片对半分剩余空间，收起时固定 170px。
+            // 不用 `root.height * 0.5` 这类写法：窗口高度经由布局信息参与约束，
+            // 引用它会形成绑定环（slint 明确警告可能运行时 panic）。
+            // 改用「始终参与 stretch + 收起时用 max-height 封顶」表达两种状态。
+            vertical-stretch: 1;
+            min-height: 170px;
+            max-height: root.log-expanded ? 4096px : 170px;
             background: Theme.log-bg;
             border-radius: 10px;
             clip: true;
@@ -509,6 +631,11 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                         color: #8ca2c0;
                         vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    AppButton {
+                        text: root.log-expanded ? "收起日志" : "展开日志";
+                        clicked => { root.log-expanded = !root.log-expanded; }
                     }
                 }
 

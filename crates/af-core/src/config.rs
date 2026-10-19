@@ -161,6 +161,13 @@ pub struct AppConfig {
     pub roles: Vec<Role>,
     #[serde(default)]
     pub rules: Vec<ScreenRule>,
+    /// 上次退出时的窗口尺寸（逻辑像素）。下次启动恢复，免得每次都是默认 880×640。
+    ///
+    /// 旧配置没有这两个字段 → `None` → 用界面声明的默认尺寸。
+    #[serde(default)]
+    pub window_width: Option<u32>,
+    #[serde(default)]
+    pub window_height: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -172,6 +179,8 @@ impl Default for AppConfig {
             event_driven: default_event_driven(),
             roles: Role::default_set(),
             rules: Vec::new(),
+            window_width: None,
+            window_height: None,
         }
     }
 }
@@ -507,6 +516,32 @@ fn short_id(id: &str) -> String {
     format!("…{shown}")
 }
 
+/// 按型号名把在线显示器和音频端点配对，供「一键匹配」用。
+///
+/// HDMI/DP 音频的普遍形态：显示器的 EDID 型号名（如 `H24T7`）会出现在它挂的
+/// 音频端点的友好名里（`H24T7 (NVIDIA High Definition Audio)`）。拿这个规律
+/// 配对，能把"每块屏绑它自己的音箱"从手工选 8 次下拉框变成点一下。
+///
+/// 返回 `(设备名, 型号名, 稳定标识, 端点)`，只收配得上的；某块屏**是否已有绑定**
+/// 由调用方判断（这里只管"谁和谁是一对"）。名字匹配不区分大小写。
+pub fn name_matched_pairs(
+    monitors: &[Monitor],
+    endpoints: &[AudioEndpoint],
+) -> Vec<(String, String, Option<String>, AudioEndpoint)> {
+    let mut out = Vec::new();
+    for m in monitors {
+        // 没读到型号名的屏（退回「显示器 N」的那种）没有可匹配的锚点
+        if m.name.is_empty() {
+            continue;
+        }
+        let needle = m.name.to_lowercase();
+        if let Some(ep) = endpoints.iter().find(|e| e.name.to_lowercase().contains(&needle)) {
+            out.push((m.device.clone(), m.name.clone(), m.key.clone(), ep.clone()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,6 +586,36 @@ mod tests {
         assert!(cfg.rules[0].enabled);
         assert_eq!(cfg.rules[0].monitor_name, "");
         assert_eq!(cfg.rules[0].monitor_key, None, "旧配置没有键，按无键处理");
+        assert_eq!(cfg.window_width, None, "旧配置没有窗口尺寸，按默认");
+        assert_eq!(cfg.window_height, None);
+    }
+
+    #[test]
+    fn name_matched_pairs_follows_model_name() {
+        // 本机形态：显示器型号名出现在音频端点友好名里
+        let monitors = vec![
+            live_monitor(r"\\.\DISPLAY1", Some("edid:a"), "H24T7"),
+            live_monitor(r"\\.\DISPLAY2", Some("edid:b"), "FHD"),
+            live_monitor(r"\\.\DISPLAY3", None, ""), // 没读到型号名 → 无锚点
+        ];
+        let endpoints = vec![
+            ep("{h}", "H24T7 (NVIDIA High Definition Audio)"),
+            ep("{f}", "FHD (NVIDIA High Definition Audio)"),
+            ep("{u}", "扬声器 (USB Audio Device)"),
+        ];
+        let pairs = name_matched_pairs(&monitors, &endpoints);
+        assert_eq!(pairs.len(), 2, "实际：{pairs:?}");
+        assert_eq!(pairs[0].0, r"\\.\DISPLAY1");
+        assert_eq!(pairs[0].3.id, "{h}");
+        assert_eq!(pairs[1].0, r"\\.\DISPLAY2");
+        assert_eq!(pairs[1].3.id, "{f}");
+        // 大小写不敏感：型号名与端点名的大小写不一致也要配上
+        let odd_mon = vec![live_monitor(r"\\.\DISPLAY1", None, "h24t7")];
+        let odd_ep = vec![ep("{x}", "H24T7 (NVIDIA High Definition Audio)")];
+        assert_eq!(name_matched_pairs(&odd_mon, &odd_ep).len(), 1);
+        // 型号名在所有端点里都找不到 → 这块屏不产生配对
+        let lone = vec![live_monitor(r"\\.\DISPLAY1", None, "WEIRD")];
+        assert!(name_matched_pairs(&lone, &endpoints).is_empty());
     }
 
     #[test]

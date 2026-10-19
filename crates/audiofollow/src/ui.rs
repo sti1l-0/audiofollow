@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use af_core::audio::com::Apartment;
 use af_core::audio::endpoint::AudioEndpoint;
 use af_core::audio::AudioEnv;
-use af_core::config::{AppConfig, ScreenRule};
+use af_core::config::{self, AppConfig, ScreenRule};
 use af_core::plan;
 use af_core::reconcile::{Action, Change, Reconciler};
 use af_core::win::hook::WindowEventHook;
@@ -499,29 +499,117 @@ impl AppState {
 
     // ---------------------------------------------------------- 用户动作 ----
 
-    fn add_rule(&mut self, monitor_index: usize, endpoint_index: usize) -> String {
+    /// 这块屏的稳定标识，仅当它在当前在线的屏里**唯一**时才返回。
+    ///
+    /// 同型号双屏（EDID 序列号都是 0）会共用同一个标识，写进规则反而会引起误认
+    /// （治愈时分不清谁是谁）——这种时候宁可不记，退回设备名匹配。
+    fn unique_live_key(&self, device: &str) -> Option<String> {
+        let m = self.monitors.iter().find(|m| m.device.eq_ignore_ascii_case(device))?;
+        let k = m.key.as_deref()?;
+        let same = self.monitors.iter().filter(|o| o.key.as_deref() == Some(k)).count();
+        (same == 1).then(|| k.to_string())
+    }
+
+    /// 添加（或替换）一条绑定。`Err` 的情况就地显示在按钮旁（见 `add-hint`）。
+    fn add_rule(&mut self, monitor_index: usize, endpoint_index: usize) -> Result<String, String> {
         let Some(m) = self.monitors.get(monitor_index) else {
-            return "没有可用的显示器".into();
+            return Err("没有可用的显示器".into());
         };
         let Some(ep) = self.endpoints.get(endpoint_index) else {
-            return "没有可用的音频设备".into();
+            return Err("没有可用的音频设备".into());
         };
-        // 把显示器的稳定标识记进规则：拔插后设备名会变，靠它才能认出"同一块屏"。
-        // 同型号双屏会共用一个标识（EDID 序列号都是 0），这种标识写进去反而会
-        // 引起误认——留空，退回设备名匹配（与旧版行为一致）。
-        let key = m.key.as_deref().filter(|k| {
-            self.monitors.iter().filter(|o| o.key.as_deref() == Some(*k)).count() == 1
-        });
-        let rule = ScreenRule::from_pair(&m.device, &m.name, key, ep);
+        // 把显示器的稳定标识记进规则：拔插后设备名会变，靠它才能认出"同一块屏"
+        let key = self.unique_live_key(&m.device);
+        // upsert 会顶掉「同设备名或同键」的旧规则。文案必须如实区分新增和替换，
+        // 否则用户以为只是又加了一条，没意识到旧指向已经被换掉了。
+        let existing = self
+            .config
+            .rules
+            .iter()
+            .find(|r| {
+                r.monitor_device.eq_ignore_ascii_case(&m.device)
+                    || (key.is_some() && r.monitor_key.as_deref() == key.as_deref())
+            })
+            .cloned();
+        let rule = ScreenRule::from_pair(&m.device, &m.name, key.as_deref(), ep);
         let desc = rule.describe();
+        let action = match &existing {
+            Some(old) if old.endpoint_id == ep.id => "绑定无变化：".to_string(),
+            Some(old) => format!("已更新绑定（原指向 {}）：", old.endpoint_display()),
+            None => "已添加绑定：".to_string(),
+        };
         self.config.upsert_rule(rule);
+        self.last_sync = Instant::now() - Duration::from_secs(3600); // 立刻生效
         match self.config.save() {
-            Ok(_) => {
-                self.last_sync = Instant::now() - Duration::from_secs(3600); // 立刻生效
-                format!("已添加绑定：{desc}")
-            }
-            Err(e) => format!("已添加绑定：{desc}，但保存失败：{e}"),
+            Ok(_) => Ok(format!("{action}{desc}")),
+            Err(e) => Ok(format!("{action}{desc}，但保存失败：{e}")),
         }
+    }
+
+    /// 停用/启用一条绑定。不删：停用期间那块屏上的应用恢复原路由，
+    /// 绑定本身（含设备记忆）原样保留。
+    fn toggle_rule(&mut self, index: usize) -> String {
+        let Some(rule) = self.config.rules.get_mut(index) else {
+            return "没有选中任何绑定".into();
+        };
+        rule.enabled = !rule.enabled;
+        let state = if rule.enabled { "启用" } else { "停用" };
+        let desc = format!(
+            "{} → {}",
+            rule.monitor_display_in(&self.monitors),
+            rule.endpoint_display()
+        );
+        let saved = self.config.save().is_ok();
+        // 两个方向都需要立即同步：停用 → 那块屏上的进程要还原；重新启用 → 要改道。
+        // 清掉动作去重，让变化如实上报。
+        self.last_sync = Instant::now() - Duration::from_secs(3600);
+        self.last_action.clear();
+        if saved {
+            format!("已{state}绑定：{desc}")
+        } else {
+            format!("已{state}绑定：{desc}，但保存失败")
+        }
+    }
+
+    /// 「一键匹配」：按型号名把还没绑定的在线屏配到同名音频设备
+    /// （HDMI/DP 音频的端点名里通常就含显示器型号，见 [`config::name_matched_pairs`]）。
+    fn auto_match_rules(&mut self) -> String {
+        let pairs = config::name_matched_pairs(&self.monitors, &self.endpoints);
+        let matched = pairs.len();
+        let total = self.monitors.len();
+        let mut added = 0usize;
+        let mut already_bound = 0usize;
+        for (device, name, _raw_key, ep) in pairs {
+            // 歧义键（同型号双屏）在这里同样不能记，与手动添加保持一把尺子
+            let key = self.unique_live_key(&device);
+            if self.config.rule_for_monitor(&device, key.as_deref(), &name).is_some() {
+                already_bound += 1;
+                continue;
+            }
+            self.config
+                .upsert_rule(ScreenRule::from_pair(&device, &name, key.as_deref(), &ep));
+            added += 1;
+        }
+        if added == 0 {
+            return if matched == 0 {
+                format!("没有可按型号名匹配的屏幕（{total} 块在线，都没有型号名对得上的音频设备）")
+            } else {
+                "所有能按型号名匹配的屏幕都已有绑定".into()
+            };
+        }
+        let mut msg = format!("已按型号名生成 {added} 条绑定");
+        if already_bound > 0 {
+            msg.push_str(&format!("（{already_bound} 块已有绑定，跳过）"));
+        }
+        let unmatched = total.saturating_sub(matched);
+        if unmatched > 0 {
+            msg.push_str(&format!("；另有 {unmatched} 块屏没有同名音频设备，未处理"));
+        }
+        if let Err(e) = self.config.save() {
+            self.log(format!("保存配置失败：{e}"));
+        }
+        self.last_sync = Instant::now() - Duration::from_secs(3600);
+        msg
     }
 
     fn remove_rule(&mut self, index: usize) -> String {
@@ -575,6 +663,27 @@ impl AppState {
                 }
             }
             Err(e) => format!("设置开机自动启动失败：{e}（开关已拨回）"),
+        }
+    }
+
+    /// 记住当前窗口尺寸（逻辑像素），下次启动恢复，免得每次都是默认 880×640。
+    ///
+    /// 存**逻辑**像素：物理像素随所在屏的缩放比变，跨 DPI 迁移后会失真。
+    fn remember_window(&mut self, ui: &AppWindow) {
+        let scale = ui.window().scale_factor();
+        let sz = ui.window().size();
+        if scale <= 0.0 || sz.width == 0 || sz.height == 0 {
+            return;
+        }
+        let w = (sz.width as f32 / scale).round() as u32;
+        let h = (sz.height as f32 / scale).round() as u32;
+        if self.config.window_width == Some(w) && self.config.window_height == Some(h) {
+            return;
+        }
+        self.config.window_width = Some(w);
+        self.config.window_height = Some(h);
+        if let Err(e) = self.config.save() {
+            self.log(format!("保存窗口尺寸失败：{e}"));
         }
     }
 
@@ -689,6 +798,7 @@ impl AppState {
                 self.tick();
             }
             TrayEvent::Quit => {
+                self.remember_window(ui);
                 self.shutdown();
                 // 还原已经落地，让托盘线程收工 —— 它退出事件循环时 tao 会直接
                 // 以 0 结束进程。不走 slint 的退出信号：那条路是异步的，而此刻
@@ -873,6 +983,18 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
     let ui = AppWindow::new()?;
     let mut state = AppState::new(tray_handle, apartment);
     state.log(format!("DPI 感知：{}", dpi.as_str()));
+
+    // 恢复上次的窗口尺寸（逻辑像素）。不低于界面声明的最小值，也不放大到
+    // 离谱的程度（防御手改配置文件塞进奇怪数字）。
+    if let (Some(w), Some(h)) = (state.config.window_width, state.config.window_height) {
+        let (w, h) = (w.clamp(700, 8192), h.clamp(560, 8192));
+        let scale = ui.window().scale_factor();
+        ui.window().set_size(slint::PhysicalSize::new(
+            (w as f32 * scale).round() as u32,
+            (h as f32 * scale).round() as u32,
+        ));
+    }
+
     let state = Rc::new(RefCell::new(state));
 
     {
@@ -885,10 +1007,47 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
             let mut s = st.borrow_mut();
             if mi < 0 || ei < 0 {
                 s.log("请先在上方选择屏幕和音频设备");
+                // 失败原因就地显示：只沉进日志区的话，注意力在按钮上的用户看不见
+                ui.set_add_hint("请先选择屏幕和音频设备".into());
             } else {
-                let msg = s.add_rule(mi as usize, ei as usize);
-                s.log(msg);
+                match s.add_rule(mi as usize, ei as usize) {
+                    Ok(msg) => {
+                        s.log(msg);
+                        ui.set_add_hint("".into());
+                    }
+                    Err(e) => {
+                        s.log(e.clone());
+                        ui.set_add_hint(e.into());
+                    }
+                }
             }
+            s.sync_to_ui(&ui);
+        });
+    }
+
+    {
+        let st = state.clone();
+        let w = ui.as_weak();
+        ui.on_toggle_rule(move |idx| {
+            let Some(ui) = w.upgrade() else { return };
+            if idx < 0 {
+                return;
+            }
+            let mut s = st.borrow_mut();
+            let msg = s.toggle_rule(idx as usize);
+            s.log(msg);
+            s.sync_to_ui(&ui);
+        });
+    }
+
+    {
+        let st = state.clone();
+        let w = ui.as_weak();
+        ui.on_auto_match(move || {
+            let Some(ui) = w.upgrade() else { return };
+            let mut s = st.borrow_mut();
+            let msg = s.auto_match_rules();
+            s.log(msg);
             s.sync_to_ui(&ui);
         });
     }
@@ -999,8 +1158,13 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
     // exit 前没有未落地的副作用。
     {
         let st = state.clone();
+        let w = ui.as_weak();
         ui.window().on_close_requested(move || {
+            let Some(ui) = w.upgrade() else {
+                return slint::CloseRequestResponse::HideWindow;
+            };
             if let Ok(mut s) = st.try_borrow_mut() {
+                s.remember_window(&ui);
                 if s.tray_alive {
                     s.note_window_hidden();
                     return slint::CloseRequestResponse::HideWindow;
