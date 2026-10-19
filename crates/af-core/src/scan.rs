@@ -1,11 +1,15 @@
-//! 设备扫描的决策逻辑：新旧快照比对 + 记忆治愈编排。
+//! 设备扫描的决策逻辑：新旧快照比对 + 记忆治愈 + 自动绑定。
 //!
 //! 这段逻辑原先长在 `ui.rs::refresh_devices` 里——"何时说话、何时治愈、何时强制
 //! 同步"是全程序最容易出回归的编排，却只能活在 GUI 里测不到。提炼成纯函数后，
 //! 输入是（配置 + 旧快照 + 新快照 + 模式），输出是"该做的事"，单测直接覆盖；
 //! `ui.rs` 只剩 IO：枚举设备、打日志、落盘、触发同步。
+//!
+//! 自动绑定没有按钮：屏幕的型号名（EDID）出现在某音频端点的友好名里
+//! （HDMI/DP 音频的普遍形态，如 `H24T7` 屏 → `H24T7 (NVIDIA …)`）且该屏还没有
+//! 绑定时，扫描直接配对生成。设备接入即生效。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::audio::endpoint::AudioEndpoint;
 use crate::config::AppConfig;
@@ -16,9 +20,9 @@ use crate::win::{monitor, Monitor};
 pub struct ScanOutcome {
     /// 要写进日志的行，按时间顺序。
     pub log_lines: Vec<String>,
-    /// 记忆治愈改动了配置（调用方据此落盘）。
+    /// 记忆治愈或自动绑定改动了配置（调用方据此落盘）。
     pub config_changed: bool,
-    /// 应立即触发一轮同步（设备集变化或治愈发生——用户刚插上屏，
+    /// 应立即触发一轮同步（设备集变化、治愈或自动绑定发生——用户刚插上屏，
     /// 不该再等一个完整的轮询周期）。
     pub force_sync: bool,
 }
@@ -104,7 +108,46 @@ pub fn scan(
     out.config_changed = healed;
     out.force_sync = changed || healed;
 
+    // ---- 自动绑定：型号名与端点名匹配、还没有绑定的屏，自动配对 ----
+    //
+    // 替代旧版的「一键匹配」按钮：设备接入即生效，无需任何操作。保守约束：
+    // - 一个端点只被一块屏匹配到时才绑（同型号双屏的音箱重名时分不清谁是谁）；
+    // - 稳定标识只在无歧义时记录（与手动添加同一把尺子，见 unique_key_of）；
+    // - 已有绑定的屏跳过——周期扫描每几秒跑一次，幂等是硬要求。
+    let pairs = crate::config::name_matched_pairs(new_monitors, new_endpoints);
+    let mut ep_claims: HashMap<&str, usize> = HashMap::new();
+    for (_, _, _, ep) in &pairs {
+        *ep_claims.entry(ep.id.as_str()).or_default() += 1;
+    }
+    for (device, name, _, ep) in &pairs {
+        if ep_claims.get(ep.id.as_str()) != Some(&1) {
+            continue;
+        }
+        if config.rule_for_monitor(device, None, name).is_some() {
+            continue;
+        }
+        let key = new_monitors
+            .iter()
+            .find(|m| m.device.eq_ignore_ascii_case(device))
+            .and_then(|m| unique_key_of(m, new_monitors));
+        config.upsert_rule(crate::config::ScreenRule::from_pair(device, name, key.as_deref(), ep));
+        out.log_lines.push(format!(
+            "已自动绑定：{} → {}（按型号名「{name}」匹配）",
+            monitor::name_from_device(device),
+            ep.name
+        ));
+        out.config_changed = true;
+        out.force_sync = true;
+    }
+
     out
+}
+
+/// 该屏的稳定标识，仅当它在线上**唯一**（没有第二块同键的屏）时才可记录。
+fn unique_key_of(m: &Monitor, monitors: &[Monitor]) -> Option<String> {
+    let k = m.key.as_deref()?;
+    let same = monitors.iter().filter(|o| o.key.as_deref() == Some(k)).count();
+    (same == 1).then(|| k.to_string())
 }
 
 #[cfg(test)]
@@ -186,6 +229,41 @@ mod tests {
         assert!(out.log_lines.is_empty(), "实际：{:?}", out.log_lines);
         assert!(!out.force_sync);
         assert!(!out.config_changed);
+    }
+
+    #[test]
+    fn scan_auto_binds_matching_screens_without_a_button() {
+        // 屏幕型号名出现在端点名里、且还没有绑定 → 扫描时自动生成，无需按钮
+        let mut cfg = AppConfig::default();
+        let m = vec![mon(r"\\.\DISPLAY1", Some("edid:h"), "H24T7")];
+        let e = vec![ep("e1", "H24T7 (NVIDIA High Definition Audio)")];
+
+        let out = scan(&mut cfg, &m, &e, &m, &e, false, true, true);
+
+        assert_eq!(cfg.rules.len(), 1);
+        assert_eq!(cfg.rules[0].endpoint_id, "e1");
+        assert_eq!(cfg.rules[0].monitor_key.as_deref(), Some("edid:h"), "唯一键要记下来");
+        assert!(out.config_changed && out.force_sync);
+        assert!(out.log_lines.iter().any(|l| l.contains("已自动绑定")), "{:?}", out.log_lines);
+
+        // 幂等：再扫一遍不重复生成、一个字都不说、不强制同步
+        let out2 = scan(&mut cfg, &m, &e, &m, &e, false, true, true);
+        assert_eq!(cfg.rules.len(), 1);
+        assert!(out2.log_lines.is_empty(), "{:?}", out2.log_lines);
+        assert!(!out2.force_sync);
+    }
+
+    #[test]
+    fn scan_skips_ambiguous_endpoint_claims() {
+        // 同型号双屏、音箱同名：两块屏都匹配同一个端点 → 分不清谁是谁，都不自动绑
+        let mut cfg = AppConfig::default();
+        let m = vec![mon(r"\\.\DISPLAY4", None, "TWIN"), mon(r"\\.\DISPLAY5", None, "TWIN")];
+        let e = vec![ep("e1", "TWIN Audio")];
+
+        let out = scan(&mut cfg, &m, &e, &m, &e, false, true, true);
+
+        assert!(cfg.rules.is_empty(), "歧义认领不能自动绑");
+        assert!(!out.force_sync);
     }
 
     #[test]

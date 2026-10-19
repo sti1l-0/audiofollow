@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use af_core::audio::com::Apartment;
 use af_core::audio::endpoint::AudioEndpoint;
 use af_core::audio::AudioEnv;
-use af_core::config::{self, AppConfig, ScreenRule};
+use af_core::config::{AppConfig, ScreenRule};
 use af_core::plan;
 use af_core::reconcile::{Action, Change, Reconciler};
 use af_core::win::hook::WindowEventHook;
@@ -499,72 +499,6 @@ impl AppState {
         }
     }
 
-    /// 停用/启用一条绑定。不删：停用期间那块屏上的应用恢复原路由，
-    /// 绑定本身（含设备记忆）原样保留。
-    fn toggle_rule(&mut self, index: usize) -> String {
-        let Some(rule) = self.config.rules.get_mut(index) else {
-            return "没有选中任何绑定".into();
-        };
-        rule.enabled = !rule.enabled;
-        let state = if rule.enabled { "启用" } else { "停用" };
-        let desc = format!(
-            "{} → {}",
-            rule.monitor_display_in(&self.monitors),
-            rule.endpoint_display()
-        );
-        let saved = self.config.save().is_ok();
-        // 两个方向都需要立即同步：停用 → 那块屏上的进程要还原；重新启用 → 要改道。
-        // 清掉动作去重，让变化如实上报。
-        self.last_sync = Instant::now() - Duration::from_secs(3600);
-        self.last_action.clear();
-        if saved {
-            format!("已{state}绑定：{desc}")
-        } else {
-            format!("已{state}绑定：{desc}，但保存失败")
-        }
-    }
-
-    /// 「一键匹配」：按型号名把还没绑定的在线屏配到同名音频设备
-    /// （HDMI/DP 音频的端点名里通常就含显示器型号，见 [`config::name_matched_pairs`]）。
-    fn auto_match_rules(&mut self) -> String {
-        let pairs = config::name_matched_pairs(&self.monitors, &self.endpoints);
-        let matched = pairs.len();
-        let total = self.monitors.len();
-        let mut added = 0usize;
-        let mut already_bound = 0usize;
-        for (device, name, _raw_key, ep) in pairs {
-            // 歧义键（同型号双屏）在这里同样不能记，与手动添加保持一把尺子
-            let key = self.unique_live_key(&device);
-            if self.config.rule_for_monitor(&device, key.as_deref(), &name).is_some() {
-                already_bound += 1;
-                continue;
-            }
-            self.config
-                .upsert_rule(ScreenRule::from_pair(&device, &name, key.as_deref(), &ep));
-            added += 1;
-        }
-        if added == 0 {
-            return if matched == 0 {
-                format!("没有可按型号名匹配的屏幕（{total} 块在线，都没有型号名对得上的音频设备）")
-            } else {
-                "所有能按型号名匹配的屏幕都已有绑定".into()
-            };
-        }
-        let mut msg = format!("已按型号名生成 {added} 条绑定");
-        if already_bound > 0 {
-            msg.push_str(&format!("（{already_bound} 块已有绑定，跳过）"));
-        }
-        let unmatched = total.saturating_sub(matched);
-        if unmatched > 0 {
-            msg.push_str(&format!("；另有 {unmatched} 块屏没有同名音频设备，未处理"));
-        }
-        if let Err(e) = self.config.save() {
-            self.log(format!("保存配置失败：{e}"));
-        }
-        self.last_sync = Instant::now() - Duration::from_secs(3600);
-        msg
-    }
-
     fn remove_rule(&mut self, index: usize) -> String {
         let Some(rule) = self.config.rules.get(index) else {
             return "没有选中任何绑定".into();
@@ -970,33 +904,6 @@ pub fn run(dpi: DpiAwareness, show_window: bool) -> Result<(), slint::PlatformEr
                     }
                 }
             }
-            s.sync_to_ui(&ui);
-        });
-    }
-
-    {
-        let st = state.clone();
-        let w = ui.as_weak();
-        ui.on_toggle_rule(move |idx| {
-            let Some(ui) = w.upgrade() else { return };
-            if idx < 0 {
-                return;
-            }
-            let mut s = st.borrow_mut();
-            let msg = s.toggle_rule(idx as usize);
-            s.log(msg);
-            s.sync_to_ui(&ui);
-        });
-    }
-
-    {
-        let st = state.clone();
-        let w = ui.as_weak();
-        ui.on_auto_match(move || {
-            let Some(ui) = w.upgrade() else { return };
-            let mut s = st.borrow_mut();
-            let msg = s.auto_match_rules();
-            s.log(msg);
             s.sync_to_ui(&ui);
         });
     }

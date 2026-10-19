@@ -293,8 +293,6 @@ export component AppWindow inherits Window {
     // ---- Rust 侧挂接的动作 ----
     callback add-rule();
     callback remove-rule(int);
-    callback toggle-rule(int);
-    callback auto-match();
     callback rescan();
     callback apply-now();
     callback toggle-auto-follow(bool);
@@ -405,13 +403,6 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
-                    // 按型号名自动配对：HDMI/DP 音频的端点名里通常就含显示器型号
-                    //（如「H24T7 (NVIDIA High Definition Audio)」），点一下就能把
-                    // 还没绑定的屏配到自己的音箱上，省去逐个选下拉框。
-                    AppButton {
-                        text: "一键匹配";
-                        clicked => { root.auto-match(); }
-                    }
                     Text {
                         text: root.rules.length + " 条绑定";
                         font-size: 12px;
@@ -471,7 +462,7 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                         }
                         Text {
-                            text: "点「一键匹配」按型号名自动配对；或从上方选一块屏幕和一台音频设备。\n之后窗口拖到那块屏，它的声音就会切到对应设备。";
+                            text: "屏幕接入后，程序会按设备记忆与型号名自动匹配音频设备并生成绑定；\n也可以从上方手动选择。窗口拖到那块屏，它的声音就会切到对应设备。";
                             font-size: 12px;
                             color: Theme.text-3;
                             horizontal-alignment: center;
@@ -542,13 +533,6 @@ export component AppWindow inherits Window {
                                     font-size: 11px;
                                     color: Theme.danger;
                                     vertical-alignment: center;
-                                }
-
-                                // 行内停用开关：不删绑定，只是让这块屏暂时不参与
-                                // 改道（那块屏上的应用恢复原路由）
-                                Switch {
-                                    checked: r.enabled;
-                                    toggled(on) => { root.toggle-rule(index); }
                                 }
 
                                 // 行内删除:hover 变红底,armed 变红底白叉。
@@ -633,9 +617,29 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    AppButton {
-                        text: root.log-expanded ? "收起日志" : "展开日志";
-                        clicked => { root.log-expanded = !root.log-expanded; }
+                    // 展开状态用箭头表达：展开时箭头朝上（点它收起），收起时朝下。
+                    // 不用文字按钮：日志区的操作不值得占一行字。
+                    Rectangle {
+                        width: 26px;
+                        log-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.log-expanded = !root.log-expanded; }
+                        }
+                        Path {
+                            width: 12px;
+                            height: 7px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            viewbox-width: 12;
+                            viewbox-height: 7;
+                            commands: root.log-expanded
+                                ? "M 1 6 L 6 1 L 11 6"
+                                : "M 1 1 L 6 6 L 11 1";
+                            stroke: log-ta.has-hover ? #b8cbe6 : #8ca2c0;
+                            stroke-width: 1.6px;
+                            stroke-line-cap: round;
+                            stroke-line-join: round;
+                        }
                     }
                 }
 
